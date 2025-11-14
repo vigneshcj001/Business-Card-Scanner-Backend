@@ -1,4 +1,3 @@
-# backend.py
 import os
 import io
 import re
@@ -288,6 +287,29 @@ def extract_details(text: str) -> Dict[str, Any]:
             if cleaned and 1 <= len(cleaned.split()) <= 4:
                 name_candidate = " ".join([w.capitalize() for w in cleaned.split()])
                 break
+
+    # Additional simple NAME heuristics (user-provided): prefer prominent ALL-UPPER lines anywhere
+    if not name_candidate:
+        uppercase_lines = []
+        for l in lines:
+            clean = re.sub(r"[^A-Za-z\s]", "", l).strip()
+            if clean and clean.replace(" ", "").isupper() and len(clean.split()) <= 4:
+                uppercase_lines.append(clean)
+        if uppercase_lines:
+            name_candidate = uppercase_lines[0].title()
+        else:
+            for l in lines:
+                if l == data.get("company") or l == data.get("designation"):
+                    continue
+                if re.search(r"[\w\.-]+@[\w\.-]+", l):
+                    continue
+                if re.search(r"\+?\d", l):
+                    continue
+                if 1 <= len(l.split()) <= 4 and len(l) < 60:
+                    candidate_clean = re.sub(r"[^A-Za-z\s]", "", l).strip()
+                    if candidate_clean:
+                        name_candidate = " ".join([w.capitalize() for w in candidate_clean.split()])
+                        break
 
     # If candidate looks like the company (or equals it), attempt stronger fallbacks
     if name_candidate:
