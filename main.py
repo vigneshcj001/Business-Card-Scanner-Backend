@@ -3,7 +3,7 @@ import os
 import io
 import re
 from datetime import datetime
-from typing import List, Optional, Any, Dict
+from typing import List, Optional, Any, Dict, Tuple
 
 from fastapi import FastAPI, File, UploadFile, Body, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,12 +14,12 @@ from PIL import Image
 import pytesseract
 from dotenv import load_dotenv
 import pytz
+import logging
 
 # --- Additional libs for classification/validation ---
 import phonenumbers
 import tldextract
 import validators
-import logging
 
 # Try loading spaCy NER (optional)
 try:
@@ -76,7 +76,7 @@ class ContactCreate(BaseModel):
     website: Optional[str] = ""
     address: Optional[str] = ""
     social_links: Optional[List[str]] = []
-    more_details: Optional[str] = ""            # added so frontend can send it
+    more_details: Optional[str] = ""
     additional_notes: Optional[str] = ""
 
     @validator("phone_numbers", pre=True)
@@ -103,6 +103,7 @@ class ContactCreate(BaseModel):
 def extract_details(text: str) -> Dict[str, Any]:
     """
     Parse OCR text into structured contact fields with improved name/company heuristics.
+    Returns a dict with keys including more_details="" (intentionally empty for user to fill).
     """
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     raw_text = " ".join(lines)
@@ -116,7 +117,7 @@ def extract_details(text: str) -> Dict[str, Any]:
         "website": "",
         "address": "",
         "social_links": [],
-        "more_details": "",            # start empty so user fills it
+        "more_details": "",            # start empty so user fills it in frontend
         "additional_notes": raw_text,
     }
 
@@ -152,22 +153,20 @@ def extract_details(text: str) -> Dict[str, Any]:
         low = line.lower()
         if any(kw in low for kw in designation_keywords):
             words = line.split()
-            limited = " ".join(words[:6])  # a few more words allowed
+            limited = " ".join(words[:6])  # keep short
             clean = re.sub(r"[^A-Za-z&\s\-\./]", "", limited).strip()
-            # remove small OCR garbage tokens
             clean = re.sub(r"\b(fm|fin|fmr)\b", "", clean, flags=re.I).strip()
             data["designation"] = clean
             break
 
     # -----------------------------------------
-    # IMPROVED COMPANY DETECTION (handles lowercase & avoids addresses)
+    # COMPANY / NAME heuristics (conservative)
     # -----------------------------------------
     company_keywords = [
         "pvt", "private", "ltd", "llp", "inc", "solutions",
         "technologies", "tech", "corporation", "company", "corp", "industries", "works", "enterprises"
     ]
 
-    # tokens that strongly suggest an address (skip these when picking company)
     address_tokens = [
         "street", "st", "road", "rd", "nagar", "lane", "city", "tamilnadu", "india", "pincode",
         "pin", "near", "opp", "zip", "avenue", "av", "bldg", "building", "suite", "ste", "floor"
@@ -182,7 +181,6 @@ def extract_details(text: str) -> Dict[str, Any]:
             return False
         if len(clean) > 40:
             return False
-        # reject if contains common company keywords
         if any(w in line.lower() for w in company_keywords):
             return False
         if re.search(r"\d", line):
@@ -197,24 +195,16 @@ def extract_details(text: str) -> Dict[str, Any]:
     company_candidates = []
     for line in lines:
         low = line.lower().strip()
-
-        # skip lines with digits (likely an address / phone / street number)
         if re.search(r"\d", low):
             continue
-
-        # skip if line contains address-like tokens
         if any(tok in low for tok in address_tokens):
             continue
-
-        # prefer explicit company keywords
         if any(kw in low for kw in company_keywords):
             company_candidates.append(line.strip())
 
-    # fallback: pick a short non-name, non-address line (more conservative)
     if not company_candidates:
         for line in lines:
             low = line.lower().strip()
-            # skip lines that look like email/phones or contain digits
             if re.search(r"[\w\.-]+@[\w\.-]+", line) or re.search(r"\+?\d", line):
                 continue
             if any(tok in low for tok in address_tokens):
@@ -223,7 +213,6 @@ def extract_details(text: str) -> Dict[str, Any]:
             if not clean_alpha:
                 continue
             if 1 <= len(clean_alpha.split()) <= 6 and len(clean_alpha) <= 60:
-                # avoid picking pure-person-looking lines (let name logic handle that)
                 if not looks_like_name(line):
                     company_candidates.append(line.strip())
                     break
@@ -231,25 +220,17 @@ def extract_details(text: str) -> Dict[str, Any]:
     if company_candidates:
         data["company"] = company_candidates[0]
 
-    # -----------------------------------------
-    # IMPROVED NAME DETECTION (lowercase & mixed case)
-    # -----------------------------------------
+    # Name detection
     name_candidates = []
     for line in lines:
-        # strip leading noise like copyright/trademark bullets/symbols
         clean_line = re.sub(r"^[\u00A9\u00AE©®\s\W]+", "", line).strip()
-
-        # ignore obvious contact lines
         if re.search(r"[\w\.-]+@[\w\.-]+", clean_line) or re.search(r"\+?\d", clean_line):
             continue
-
-        # heuristic: looks like a person name
         if looks_like_name(clean_line):
             if clean_line == data.get("company") or clean_line == data.get("designation"):
                 continue
             name_candidates.append(clean_line)
 
-    # If spaCy NER available, prefer PERSON entity
     if nlp:
         try:
             full_text = " ".join(lines)
@@ -263,11 +244,9 @@ def extract_details(text: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # fallback logic if spaCy not available or didn't find anything
     if not data["name"] and name_candidates:
         data["name"] = name_candidates[0]
     elif not data["name"]:
-        # previous uppercase heuristic as last resort
         uppercase_lines = []
         for l in lines:
             cleaned = re.sub(r"[^A-Za-z\s]", "", l).strip()
@@ -276,7 +255,6 @@ def extract_details(text: str) -> Dict[str, Any]:
         if uppercase_lines:
             data["name"] = uppercase_lines[0]
         else:
-            # final fallback: first short non-contact, non-company line
             for l in lines:
                 if l == data["company"] or l == data["designation"]:
                     continue
@@ -302,7 +280,6 @@ def extract_details(text: str) -> Dict[str, Any]:
         if isinstance(data.get(k), str):
             data[k] = data[k].strip()
 
-    # small extra cleanup: remove stray leading/trailing punctuation in name/company
     data["name"] = re.sub(r"^[\W_]+|[\W_]+$", "", data.get("name", ""))
     data["company"] = re.sub(r"^[\W_]+|[\W_]+$", "", data.get("company", ""))
 
@@ -318,10 +295,6 @@ def now_ist() -> str:
 # -----------------------------------------
 # Classification helper (validate & enrich)
 # -----------------------------------------
-# NOTE: we compute the validations internally but we do not force/save a populated
-# "more_details" here. Instead, new inserts will have more_details="" by default
-# (handled in extract_details / create/upload logic). field_validations is kept
-# but the frontend hides it from users.
 SOCIAL_PLATFORMS = {
     "linkedin": ["linkedin.com", "linkedin"],
     "twitter": ["twitter.com", "x.com", "t.co", "twitter"],
@@ -412,7 +385,7 @@ def classify_contact(contact: Dict[str, Any]) -> Dict[str, Any]:
     """
     Validate & enrich contact. Returns a new dict with added:
       - field_validations (structured)
-      - more_details is intentionally left/kept empty for user to fill
+      - more_details intentionally left empty unless provided
     """
     c = dict(contact)  # shallow copy
 
@@ -494,13 +467,13 @@ def classify_contact(contact: Dict[str, Any]) -> Dict[str, Any]:
         "designation": {"value": designation}
     }
 
-    # Attach validations, but keep more_details intentionally empty here:
     c["field_validations"] = field_validations
-    # DO NOT auto-populate "more_details" — allow user to fill in frontend.
+
+    # Keep more_details empty unless provided in the contact dict (frontend controls this)
     if "more_details" not in c or not c.get("more_details"):
         c["more_details"] = ""
 
-    # Ensure the phone and social fields stay normalized types
+    # Ensure normalized types
     c["phone_numbers"] = phones
     c["social_links"] = socials
 
@@ -521,7 +494,7 @@ async def upload_card(file: UploadFile = File(...)):
         text = pytesseract.image_to_string(img)
         extracted = extract_details(text)
 
-        # classify & enrich before storing
+        # classify & enrich before storing (computes validations but leaves more_details empty)
         extracted = classify_contact(extracted)
 
         # ensure more_details is empty for newly created records (user will fill later)
@@ -558,11 +531,10 @@ async def create_card(payload: ContactCreate):
         if doc.get("email"):
             existing = collection.find_one({"email": doc["email"]})
             if existing:
-                # merge/overwrite fields and set edited_at
-                doc["edited_at"] = now_ist()
                 # preserve existing more_details if user didn't provide one
                 if not doc.get("more_details"):
                     doc["more_details"] = existing.get("more_details", "")
+                doc["edited_at"] = now_ist()
                 collection.update_one({"_id": existing["_id"]}, {"$set": doc})
                 updated = collection.find_one({"_id": existing["_id"]})
                 return {"message": "Updated existing contact", "data": JSONEncoder.encode(updated)}
@@ -616,7 +588,6 @@ def update_card(card_id: str, payload: dict = Body(...)):
         if not existing:
             raise HTTPException(status_code=404, detail="Card not found.")
 
-        # preserve existing more_details unless user explicitly provided one
         existing_more = existing.get("more_details", "")
 
         merged = dict(existing)
