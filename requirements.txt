@@ -11,3 +11,4 @@ tldextract
 spacy
 pytz
 pydantic[email]
+python-multipart
