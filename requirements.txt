@@ -9,4 +9,4 @@ phonenumbers
 validators
 tldextract
 spacy
-en-core-web-sm==3.6.0  # or simply run: python -m spacy download en_core_web_sm
+
