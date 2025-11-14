@@ -100,11 +100,13 @@ class ContactCreate(BaseModel):
 # -----------------------------------------
 # Utilities: OCR parsing + heuristics
 # -----------------------------------------
+from difflib import SequenceMatcher
+
 def extract_details(text: str) -> Dict[str, Any]:
     """
     OCR parsing with improved logic to avoid picking company as name.
     Prioritizes ALL-CAPS prominent lines near the top as person names and,
-    if company and name collide, searches for alternatives above the company line.
+    if company and name collide, searches for alternatives anywhere in the card.
     """
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     raw_text = " ".join(lines)
@@ -205,7 +207,6 @@ def extract_details(text: str) -> Dict[str, Any]:
                     company_candidates.append((idx, clean_alpha))
                     break
     if company_candidates:
-        # prefer candidates with explicit company tokens
         company_candidates.sort(key=lambda t: 0 if any(k in t[1].lower() for k in ["private", "pvt", "ltd", "llp", "inc"]) else 1)
         data["company"] = company_candidates[0][1].strip()
         company_idx = company_candidates[0][0]
@@ -214,15 +215,27 @@ def extract_details(text: str) -> Dict[str, Any]:
         company_idx = None
 
     # NAME detection with strong preference rules
-    # Top region first (usually prominent branding and name)
     top_region = lines[:6] if len(lines) >= 6 else lines
 
     def is_person_like(l):
         cleaned = re.sub(r"[^A-Za-z\s]", "", l).strip()
-        if not cleaned: 
+        if not cleaned:
             return False
         words = cleaned.split()
         return 1 <= len(words) <= 4 and len(cleaned) <= 60
+
+    def is_all_caps_word(l):
+        cleaned = re.sub(r"[^A-Za-z\s]", "", l).strip()
+        # single or two word uppercase tokens, reasonable length
+        if not cleaned: 
+            return False
+        words = cleaned.split()
+        if len(words) > 2:
+            return False
+        return all(w.isupper() and 2 <= len(w) <= 20 for w in words)
+
+    def similar(a, b):
+        return SequenceMatcher(None, (a or "").lower(), (b or "").lower()).ratio()
 
     name_candidate = ""
 
@@ -276,14 +289,14 @@ def extract_details(text: str) -> Dict[str, Any]:
                 name_candidate = " ".join([w.capitalize() for w in cleaned.split()])
                 break
 
-    # If name candidate looks like the company (or equals it), try to find another candidate above company line
+    # If candidate looks like the company (or equals it), attempt stronger fallbacks
     if name_candidate:
         comp = (data.get("company") or "").strip()
         low_name = name_candidate.lower()
         low_comp = comp.lower()
-        looks_like_company = any(kw in low_name for kw in company_keywords) or (low_comp and (low_comp in low_name or low_name in low_comp))
+        looks_like_company = any(kw in low_name for kw in company_keywords) or (low_comp and (low_comp in low_name or low_name in low_comp)) or (comp and similar(low_name, low_comp) > 0.6)
         if looks_like_company:
-            # search above company_idx if we have it, else search top_region excluding company line
+            # 1) search above company_idx if available
             alt_candidate = ""
             search_limit = company_idx if company_idx is not None else min(len(lines), 6)
             for i in range(0, search_limit):
@@ -303,10 +316,26 @@ def extract_details(text: str) -> Dict[str, Any]:
                     if capitalized >= 1:
                         alt_candidate = " ".join([w.capitalize() for w in words])
                         break
+            # 2) if still not found, scan entire card for ALL-CAPS single/two-word tokens that look like a person's given name
+            if not alt_candidate:
+                for i, l in enumerate(lines):
+                    if re.search(r"[\w\.-]+@[\w\.-]+", l) or re.search(r"\+?\d", l):
+                        continue
+                    low = l.lower()
+                    if any(tok in low for tok in address_tokens) or any(kw in low for kw in company_keywords):
+                        continue
+                    if is_all_caps_word(l):
+                        # prefer uppercase tokens that are not too brand-like (length & not containing 'solutions' etc.)
+                        candidate_upper = re.sub(r"[^A-Za-z\s]", "", l).strip()
+                        # avoid picking a company-like uppercase that shares high similarity with company
+                        if comp and similar(candidate_upper, comp) > 0.7:
+                            continue
+                        alt_candidate = candidate_upper.title()
+                        break
             if alt_candidate:
                 name_candidate = alt_candidate
             else:
-                # final fallback: keep original but strip obvious company tokens
+                # final fallback: strip company tokens from candidate and keep remainder
                 name_candidate = re.sub(r"\b(private|pvt|ltd|llp|inc|technologies|tech|works|solutions)\b", "", name_candidate, flags=re.I).strip()
 
     data["name"] = (name_candidate or "").strip()
