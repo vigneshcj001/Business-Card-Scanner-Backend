@@ -226,8 +226,9 @@ def extract_details(text: str) -> Dict[str, Any]:
         clean_line = re.sub(r"^[\u00A9\u00AE©®\s\W]+", "", line).strip()
         if re.search(r"[\w\.-]+@[\w\.-]+", clean_line) or re.search(r"\+?\d", clean_line):
             continue
-        if clean_line and looks_like_name := (lambda l: bool(re.sub(r'[^A-Za-z\s]', '', l).strip()) and 1 <= len(re.sub(r'[^A-Za-z\s]', '', l).split()) <= 4))(clean_line):
-            # exclude if equals company or designation
+        # small helper: roughly looks like a name if alpha tokens between 1 and 4
+        alpha_only = re.sub(r'[^A-Za-z\s]', '', clean_line).strip()
+        if alpha_only and 1 <= len(alpha_only.split()) <= 4:
             if clean_line != data.get("company") and clean_line != data.get("designation"):
                 name_candidates.append(clean_line)
 
@@ -265,7 +266,6 @@ def extract_details(text: str) -> Dict[str, Any]:
     data["company"] = re.sub(r"^[\W_]+|[\W_]+$", "", data.get("company", ""))
 
     return data
-
 
 # -----------------------------------------
 # Timestamp helper
