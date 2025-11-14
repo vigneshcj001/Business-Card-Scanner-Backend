@@ -102,8 +102,7 @@ class ContactCreate(BaseModel):
 # -----------------------------------------
 def extract_details(text: str) -> Dict[str, Any]:
     """
-    Parse OCR text into structured contact fields with heuristics.
-    more_details is intentionally initialized as an empty string so the user fills it.
+    Parse OCR text into structured contact fields with improved heuristics.
     """
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     raw_text = " ".join(lines)
@@ -117,30 +116,47 @@ def extract_details(text: str) -> Dict[str, Any]:
         "website": "",
         "address": "",
         "social_links": [],
-        "more_details": "",            # user fills this later
+        "more_details": "",
         "additional_notes": raw_text,
     }
 
     # EMAIL
-    email = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", raw_text)
-    data["email"] = email.group(0) if email else ""
+    email_m = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", raw_text)
+    data["email"] = email_m.group(0) if email_m else ""
 
-    # WEBSITE (prefer explicit http/www)
-    website = re.search(r"(https?://\S+|www\.\S+|\S+\.\w{2,})", raw_text)
-    data["website"] = website.group(0) if website else ""
+    # WEBSITE: prefer explicit www/http or common TLDs; avoid matching emails
+    # Only match if it does NOT contain '@'
+    website_m = re.search(
+        r"(https?://\S+|www\.\S+|\b(?![\w\.-]+@)[A-Za-z0-9\-]+\.(?:com|in|net|org|co|io|biz|info|xyz|me)\b)",
+        raw_text,
+    )
+    data["website"] = website_m.group(0) if website_m else ""
 
-    # PHONE NUMBERS (loose capture)
+    # PHONE NUMBERS (loose capture but filter out short numeric sequences like pincodes)
     phones = re.findall(r"\+?\d[\d \-\(\)xextEXT]{6,}\d", raw_text)
-    phones = [re.sub(r"[^\d\+xX]", "", p) for p in phones]
-    data["phone_numbers"] = list(dict.fromkeys(phones))  # dedupe preserving order
+    # normalize: remove non-digit except leading +
+    normed = []
+    for p in phones:
+        cleaned = re.sub(r"[^\d\+]", "", p)
+        digits_only = re.sub(r"[^\d]", "", cleaned)
+        # keep if digits length >= 8 (excludes 6-digit pincodes)
+        if len(digits_only) >= 8:
+            normed.append(cleaned)
+    data["phone_numbers"] = list(dict.fromkeys(normed))  # dedupe preserving order
 
-    # SOCIAL LINKS
+    # SOCIAL LINKS: capture any line that contains known social tokens or looks like a social URL
     for l in lines:
         low = l.lower()
         if any(s in low for s in ["linkedin", "instagram", "facebook", "twitter", "x.com", "t.me", "wa.me", "telegram"]):
             data["social_links"].append(l.strip())
+        else:
+            # also capture obvious profile-like handles (e.g. "ganapathy-subburathinam")
+            if re.search(r"[a-z0-9_\-]+\.[a-z]{2,}|[a-z0-9_\-]+-[a-z0-9_\-]+", low):
+                # skip if it's an email (we already captured that)
+                if "@" not in low:
+                    data["social_links"].append(l.strip())
 
-    # DESIGNATION heuristic
+    # DESIGNATION heuristic: prefer lines containing job keywords but clean trailing noise
     designation_keywords = [
         "founder", "ceo", "cto", "coo", "manager",
         "director", "engineer", "consultant", "head", "lead",
@@ -149,14 +165,19 @@ def extract_details(text: str) -> Dict[str, Any]:
     for line in lines:
         low = line.lower()
         if any(kw in low for kw in designation_keywords):
+            # keep first 6 words, remove non-alpha except & and .,/-
             words = line.split()
             limited = " ".join(words[:6])
-            clean = re.sub(r"[^A-Za-z&\s\-\./]", "", limited).strip()
-            clean = re.sub(r"\b(fm|fin|fmr)\b", "", clean, flags=re.I).strip()
-            data["designation"] = clean
+            clean = re.sub(r"[^A-Za-z&\s\-\./]", " ", limited).strip()
+            # remove common OCR artifacts like 'fm', 'fin', 'fmr' and trailing handles (with '-')
+            clean = re.sub(r"\b(?:fm|fin|fmr)\b", "", clean, flags=re.I).strip()
+            # drop trailing tokens that look like handles (contain '-' or are lowercase-single-words)
+            tokens = [t for t in clean.split() if not re.search(r"-", t)]
+            clean = " ".join(tokens).strip()
+            data["designation"] = re.sub(r"\s{2,}", " ", clean)
             break
 
-    # COMPANY and NAME heuristics (conservative)
+    # COMPANY detection: prefer explicit company keywords, ignore lines that look like emails/phones/addresses
     company_keywords = [
         "pvt", "private", "ltd", "llp", "inc", "solutions",
         "technologies", "tech", "corporation", "company", "corp", "industries", "works", "enterprises"
@@ -166,36 +187,17 @@ def extract_details(text: str) -> Dict[str, Any]:
         "pin", "near", "opp", "zip", "avenue", "av", "bldg", "building", "suite", "ste", "floor"
     ]
 
-    def looks_like_name(line: str) -> bool:
-        clean = re.sub(r"[^A-Za-z\s]", "", line).strip()
-        if not clean:
-            return False
-        words = clean.split()
-        if not (1 <= len(words) <= 4):
-            return False
-        if len(clean) > 40:
-            return False
-        if any(w in line.lower() for w in company_keywords):
-            return False
-        if re.search(r"\d", line):
-            return False
-        uppercase_count = sum(1 for w in words if w[:1].isupper())
-        if uppercase_count >= 1:
-            return True
-        if line.islower() and len(words) <= 3:
-            return True
-        return False
-
     company_candidates = []
     for line in lines:
         low = line.lower().strip()
-        if re.search(r"\d", low):
+        if re.search(r"[\w\.-]+@[\w\.-]+", line) or re.search(r"\+?\d", line):
             continue
         if any(tok in low for tok in address_tokens):
             continue
         if any(kw in low for kw in company_keywords):
             company_candidates.append(line.strip())
 
+    # fallback: any non-name line that looks alpha and not an email/phone/address
     if not company_candidates:
         for line in lines:
             low = line.lower().strip()
@@ -206,29 +208,33 @@ def extract_details(text: str) -> Dict[str, Any]:
             clean_alpha = re.sub(r"[^A-Za-z\s&\.\-]", "", line).strip()
             if not clean_alpha:
                 continue
-            if 1 <= len(clean_alpha.split()) <= 6 and len(clean_alpha) <= 60:
-                if not looks_like_name(line):
-                    company_candidates.append(line.strip())
+            # prefer longer lines for company (2-6 words)
+            if 2 <= len(clean_alpha.split()) <= 6 and len(clean_alpha) <= 80:
+                # avoid lines that look like person names (all uppercase short)
+                if not (clean_alpha.replace(" ", "").isupper() and len(clean_alpha.split()) <= 4):
+                    company_candidates.append(clean_alpha)
                     break
 
     if company_candidates:
-        data["company"] = company_candidates[0]
+        # prefer the candidate containing "private" or similar
+        prioritized = sorted(company_candidates, key=lambda x: 0 if any(k in x.lower() for k in ["private", "pvt", "ltd", "llp", "inc"]) else 1)
+        data["company"] = prioritized[0].strip()
 
-    # NAME detection
+    # NAME detection: conservative; exclude lines with emails/phones/address/company/designation
     name_candidates = []
     for line in lines:
         clean_line = re.sub(r"^[\u00A9\u00AE©®\s\W]+", "", line).strip()
         if re.search(r"[\w\.-]+@[\w\.-]+", clean_line) or re.search(r"\+?\d", clean_line):
             continue
-        if looks_like_name(clean_line):
-            if clean_line == data.get("company") or clean_line == data.get("designation"):
-                continue
-            name_candidates.append(clean_line)
+        if clean_line and looks_like_name := (lambda l: bool(re.sub(r'[^A-Za-z\s]', '', l).strip()) and 1 <= len(re.sub(r'[^A-Za-z\s]', '', l).split()) <= 4))(clean_line):
+            # exclude if equals company or designation
+            if clean_line != data.get("company") and clean_line != data.get("designation"):
+                name_candidates.append(clean_line)
 
-    if nlp:
+    # spaCy NER if available
+    if nlp and not data.get("name"):
         try:
-            full_text = " ".join(lines)
-            doc = nlp(full_text)
+            doc = nlp(" ".join(lines))
             persons = [ent.text for ent in doc.ents if ent.label_ == "PERSON"]
             if persons:
                 for p in persons:
@@ -240,31 +246,11 @@ def extract_details(text: str) -> Dict[str, Any]:
 
     if not data["name"] and name_candidates:
         data["name"] = name_candidates[0]
-    elif not data["name"]:
-        uppercase_lines = []
-        for l in lines:
-            cleaned = re.sub(r"[^A-Za-z\s]", "", l).strip()
-            if cleaned and cleaned.replace(" ", "").isupper() and len(cleaned.split()) <= 4:
-                uppercase_lines.append(cleaned)
-        if uppercase_lines:
-            data["name"] = uppercase_lines[0]
-        else:
-            for l in lines:
-                if l == data["company"] or l == data["designation"]:
-                    continue
-                if re.search(r"[\w\.-]+@[\w\.-]+", l):
-                    continue
-                if re.search(r"\+?\d", l):
-                    continue
-                if 1 <= len(l.split()) <= 4 and len(l) < 60:
-                    cleaned = re.sub(r"[^A-Za-z\s]", "", l).strip()
-                    data["name"] = cleaned
-                    break
 
-    # ADDRESS heuristics
+    # ADDRESS heuristics: look for lines containing address tokens or the pincode
     address_lines = []
     for l in lines:
-        if re.search(r"\d.*(street|st|road|rd|nagar|lane|city|tamilnadu|india|pincode|pin|near|opp|zip|avenue|av|bldg|building|suite|ste|floor)", l, re.I):
+        if re.search(r"\b\d{6}\b", l) or re.search(r"\b(?:street|st|road|rd|nagar|lane|peelamedu|city|tamil nadu|coimbatore|near|opp)\b", l, re.I):
             address_lines.append(l)
     if address_lines:
         data["address"] = ", ".join(address_lines)
@@ -274,10 +260,12 @@ def extract_details(text: str) -> Dict[str, Any]:
         if isinstance(data.get(k), str):
             data[k] = data[k].strip()
 
+    # final sanitization: remove leading/trailing non-word chars
     data["name"] = re.sub(r"^[\W_]+|[\W_]+$", "", data.get("name", ""))
     data["company"] = re.sub(r"^[\W_]+|[\W_]+$", "", data.get("company", ""))
 
     return data
+
 
 # -----------------------------------------
 # Timestamp helper
