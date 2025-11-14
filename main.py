@@ -2,6 +2,7 @@
 import os
 import io
 import re
+import logging
 from datetime import datetime
 from typing import List, Optional, Any, Dict
 
@@ -19,7 +20,6 @@ import pytz
 import phonenumbers
 import tldextract
 import validators
-import logging
 
 # Try loading spaCy NER (optional)
 try:
@@ -34,6 +34,10 @@ MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME = os.getenv("DB_NAME", "business_cards")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "contacts")
 PHONE_DEFAULT_REGION = os.getenv("PHONE_DEFAULT_REGION", "IN")  # default phone region
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("backend")
 
 # FastAPI setup
 app = FastAPI(title="Business Card OCR API")
@@ -122,9 +126,8 @@ def extract_details(text: str) -> Dict[str, Any]:
     email = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", raw_text)
     data["email"] = email.group(0) if email else ""
 
-    # WEBSITE
+    # WEBSITE - prefer explicit http/www, otherwise domain-like token
     website = re.search(r"(https?://\S+|www\.\S+|\S+\.\w{2,})", raw_text)
-    # prefer explicit http/www; otherwise keep any domain-like token
     data["website"] = website.group(0) if website else ""
 
     # PHONE NUMBERS (loose capture)
@@ -132,19 +135,42 @@ def extract_details(text: str) -> Dict[str, Any]:
     phones = [re.sub(r"[^\d\+xX]", "", p) for p in phones]
     data["phone_numbers"] = list(dict.fromkeys(phones))  # dedupe preserving order
 
-    # SOCIAL LINKS
+    # SOCIAL LINKS: lines containing common platforms
     for l in lines:
         low = l.lower()
         if any(s in low for s in ["linkedin", "instagram", "facebook", "twitter", "x.com", "t.me", "wa.me", "telegram"]):
             data["social_links"].append(l.strip())
 
+    # ---------- Pre-filtering: detect address-like & boilerplate lines ----------
+    address_lines = []
+    non_content_lines = set()  # indexes of lines to ignore for company/name (addresses, boilerplate)
+    # address-ish keywords
+    address_indicators = r"\b(street|st|road|rd|nagar|lane|avenue|av|bldg|building|suite|floor|pincode|pin|zip|india|tamilnadu|district|city|near|opp|avenue|avenue)\b"
+    for idx, l in enumerate(lines):
+        # if contains an address-indicator or a long sequence with numbers (pincode, street no)
+        if re.search(address_indicators, l, re.I) or re.search(r"\d{3,}", l):
+            address_lines.append(l)
+            non_content_lines.add(idx)
+
+    # Remove obvious boilerplate/noise lines (copyright, 'by', 'from', 'fm' OCR artifact)
+    for idx, l in enumerate(lines):
+        if re.search(r"©|copyright|\bby\b|\bfrom\b|\bfm\b|\bv?ia\b", l, re.I):
+            non_content_lines.add(idx)
+
+    # Build cleaned lines excluding non-content ones for company/name detection
+    cleaned_lines = [l for i, l in enumerate(lines) if i not in non_content_lines]
+
+    # If address_lines found, use them for address
+    if address_lines:
+        data["address"] = ", ".join(address_lines)
+
     # -----------------------------------------
-    # IMPROVED DESIGNATION LOGIC (unchanged mostly)
+    # IMPROVED DESIGNATION LOGIC
     # -----------------------------------------
     designation_keywords = [
         "founder", "ceo", "cto", "coo", "manager",
         "director", "engineer", "consultant", "head", "lead",
-        "president", "vp", "vice", "principal", "officer"
+        "president", "vp", "vice", "principal", "officer", "owner"
     ]
 
     for line in lines:
@@ -153,24 +179,43 @@ def extract_details(text: str) -> Dict[str, Any]:
             words = line.split()
             limited = " ".join(words[:6])  # a few more words allowed
             clean = re.sub(r"[^A-Za-z&\s\-\/\.]", "", limited).strip()
+            # strip OCR artifacts like 'fm' or 'by' at begin
+            clean = re.sub(r"^(fm|by|from)\b[\s:,-]*", "", clean, flags=re.I).strip()
             data["designation"] = clean
             break
 
     # -----------------------------------------
-    # IMPROVED COMPANY DETECTION (handles lowercase)
+    # IMPROVED COMPANY DETECTION (prefer explicit indicators, avoid address/boilerplate)
     # -----------------------------------------
     company_keywords = [
         "pvt", "private", "ltd", "llp", "inc", "solutions",
-        "technologies", "tech", "corporation", "company", "corp", "industries", "works", "enterprises"
+        "technologies", "tech", "corporation", "company", "corp",
+        "industries", "works", "enterprises", "real estate", "properties",
+        "co", "& co", "group", "partners", "associates"
     ]
 
     company_candidates = []
-    for line in lines:
+
+    # 1) Prefer lines (from cleaned_lines) containing explicit company keywords or patterns
+    for line in cleaned_lines:
         low = line.lower()
-        if any(kw in low for kw in company_keywords):
+        # skip lines that look like emails/phones
+        if re.search(r"@|\+?\d", line):
+            continue
+        if any(kw in low for kw in company_keywords) or re.search(r"\b&\b|\bco\.?\b|\bcompany\b", low):
             company_candidates.append(line.strip())
 
-    # fallback: lines 1-4 words that aren't names (heuristic)
+    # 2) If none found, try spaCy ORG detection (if available)
+    if not company_candidates and nlp:
+        try:
+            doc = nlp(" ".join(cleaned_lines[:6]))  # look at top lines only
+            orgs = [ent.text for ent in doc.ents if ent.label_ == "ORG"]
+            if orgs:
+                company_candidates.extend(orgs)
+        except Exception:
+            logger.exception("spaCy ORG detection failed")
+
+    # helper: reuse looks_like_name below, but declare it early
     def looks_like_name(line: str) -> bool:
         clean = re.sub(r"[^A-Za-z\s]", "", line).strip()
         if not clean:
@@ -180,10 +225,10 @@ def extract_details(text: str) -> Dict[str, Any]:
             return False
         if len(clean) > 40:
             return False
-        # reject if contains common company keywords
-        if any(w in line.lower() for w in company_keywords):
-            return False
         if re.search(r"\d", line):
+            return False
+        # reject lines that contain company keywords (they are unlikely names)
+        if any(kw in line.lower() for kw in company_keywords):
             return False
         uppercase_count = sum(1 for w in words if w[:1].isupper())
         if uppercase_count >= 1:
@@ -192,15 +237,26 @@ def extract_details(text: str) -> Dict[str, Any]:
             return True
         return False
 
+    # 3) Final fallback: pick first cleaned_line that doesn't look like a person/name/address/phone/email
     if not company_candidates:
-        for line in lines:
-            clean = re.sub(r"[^A-Za-z\s]", "", line).strip()
-            if clean and 1 <= len(clean.split()) <= 5:
-                if not looks_like_name(line):
-                    company_candidates.append(line.strip())
-                    break
+        for line in cleaned_lines:
+            # filter out lines that look like names (reuse looks_like_name) or contain digits/emails/phones
+            if re.search(r"@|\+?\d", line):
+                continue
+            if looks_like_name(line):
+                continue
+            if len(line) > 80:
+                continue
+            if re.search(address_indicators, line, re.I):
+                continue
+            # exclude lines that start with common noise tokens
+            if re.match(r"^(©|copyright|by|from|fm)\b", line, flags=re.I):
+                continue
+            company_candidates.append(line.strip())
+            break
 
     if company_candidates:
+        # take the best candidate
         data["company"] = company_candidates[0]
 
     # -----------------------------------------
@@ -216,6 +272,9 @@ def extract_details(text: str) -> Dict[str, Any]:
                 continue
             if re.search(r"\+?\d", line):
                 continue
+            # ignore boilerplate tokens
+            if re.search(r"©|copyright|\bby\b|\bfrom\b|\bfm\b", line, re.I):
+                continue
             name_candidates.append(line.strip())
 
     if name_candidates:
@@ -230,7 +289,7 @@ def extract_details(text: str) -> Dict[str, Any]:
         if uppercase_lines:
             data["name"] = uppercase_lines[0]
         else:
-            # final fallback: first short non-contact line
+            # final fallback: first short non-contact line (but skip company/address/boilerplate)
             for l in lines:
                 if l == data["company"] or l == data["designation"]:
                     continue
@@ -238,17 +297,22 @@ def extract_details(text: str) -> Dict[str, Any]:
                     continue
                 if re.search(r"\+?\d", l):
                     continue
+                if re.search(address_indicators, l, re.I):
+                    continue
+                if re.match(r"^(©|copyright|by|from|fm)\b", l, flags=re.I):
+                    continue
                 if 1 <= len(l.split()) <= 4 and len(l) < 60:
                     data["name"] = re.sub(r"[^A-Za-z\s]", "", l).strip()
                     break
 
-    # ADDRESS heuristics
-    address_lines = []
-    for l in lines:
-        if re.search(r"\d.*(street|st|road|rd|nagar|lane|city|tamilnadu|india|pincode|pin|near|opp|zip|avenue|av|bldg|building)", l, re.I):
-            address_lines.append(l)
-    if address_lines:
-        data["address"] = ", ".join(address_lines)
+    # ADDRESS fallback: if we have no detected address but some longer lines that look like addresses, attempt to join
+    if not data["address"]:
+        address_candidates = []
+        for l in lines:
+            if re.search(address_indicators, l, re.I) or re.search(r"\d{3,}", l):
+                address_candidates.append(l)
+        if address_candidates:
+            data["address"] = ", ".join(address_candidates)
 
     # Trim strings
     for k in ["name", "designation", "company", "address", "email", "website"]:
@@ -491,7 +555,14 @@ async def upload_card(file: UploadFile = File(...)):
     try:
         content = await file.read()
         img = Image.open(io.BytesIO(content))
-        text = pytesseract.image_to_string(img)
+        # Optionally pre-process image here (e.g., convert to RGB, resize, threshold) if OCR noisy
+        try:
+            text = pytesseract.image_to_string(img)
+        except Exception:
+            # fallback try: convert to RGB then OCR
+            img = img.convert("RGB")
+            text = pytesseract.image_to_string(img)
+
         extracted = extract_details(text)
 
         # classify & enrich before storing
@@ -504,7 +575,7 @@ async def upload_card(file: UploadFile = File(...)):
         inserted = collection.find_one({"_id": result.inserted_id})
         return {"message": "Inserted Successfully", "data": JSONEncoder.encode(inserted)}
     except Exception as e:
-        logging.exception("upload_card error")
+        logger.exception("upload_card error")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/create_card", status_code=status.HTTP_201_CREATED)
@@ -532,7 +603,7 @@ async def create_card(payload: ContactCreate):
         inserted = collection.find_one({"_id": result.inserted_id})
         return {"message": "Inserted Successfully", "data": JSONEncoder.encode(inserted)}
     except Exception as e:
-        logging.exception("create_card error")
+        logger.exception("create_card error")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/all_cards")
@@ -541,7 +612,7 @@ def get_all_cards():
         docs = list(collection.find().sort([("_id", -1)]))
         return {"data": JSONEncoder.encode(docs)}
     except Exception as e:
-        logging.exception("get_all_cards error")
+        logger.exception("get_all_cards error")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.put("/update_notes/{card_id}")
@@ -556,7 +627,7 @@ def update_notes(card_id: str, payload: dict = Body(...)):
         updated = collection.find_one({"_id": ObjectId(card_id)})
         return {"message": "Updated", "data": JSONEncoder.encode(updated)}
     except Exception as e:
-        logging.exception("update_notes error")
+        logger.exception("update_notes error")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.patch("/update_card/{card_id}")
@@ -594,7 +665,7 @@ def update_card(card_id: str, payload: dict = Body(...)):
     except HTTPException:
         raise
     except Exception as e:
-        logging.exception("update_card error")
+        logger.exception("update_card error")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/delete_card/{card_id}", status_code=status.HTTP_200_OK)
@@ -606,5 +677,5 @@ def delete_card(card_id: str):
         else:
             raise HTTPException(status_code=404, detail="Card not found.")
     except Exception as e:
-        logging.exception("delete_card error")
+        logger.exception("delete_card error")
         raise HTTPException(status_code=500, detail=str(e))
