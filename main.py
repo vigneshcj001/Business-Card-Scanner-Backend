@@ -76,6 +76,7 @@ class ContactCreate(BaseModel):
     website: Optional[str] = ""
     address: Optional[str] = ""
     social_links: Optional[List[str]] = []
+    more_details: Optional[str] = ""            # added so frontend can send it
     additional_notes: Optional[str] = ""
 
     @validator("phone_numbers", pre=True)
@@ -115,6 +116,7 @@ def extract_details(text: str) -> Dict[str, Any]:
         "website": "",
         "address": "",
         "social_links": [],
+        "more_details": "",            # start empty so user fills it
         "additional_notes": raw_text,
     }
 
@@ -296,7 +298,7 @@ def extract_details(text: str) -> Dict[str, Any]:
         data["address"] = ", ".join(address_lines)
 
     # Trim strings and final cleanup
-    for k in ["name", "designation", "company", "address", "email", "website"]:
+    for k in ["name", "designation", "company", "address", "email", "website", "more_details"]:
         if isinstance(data.get(k), str):
             data[k] = data[k].strip()
 
@@ -316,6 +318,10 @@ def now_ist() -> str:
 # -----------------------------------------
 # Classification helper (validate & enrich)
 # -----------------------------------------
+# NOTE: we compute the validations internally but we do not force/save a populated
+# "more_details" here. Instead, new inserts will have more_details="" by default
+# (handled in extract_details / create/upload logic). field_validations is kept
+# but the frontend hides it from users.
 SOCIAL_PLATFORMS = {
     "linkedin": ["linkedin.com", "linkedin"],
     "twitter": ["twitter.com", "x.com", "t.co", "twitter"],
@@ -406,7 +412,7 @@ def classify_contact(contact: Dict[str, Any]) -> Dict[str, Any]:
     """
     Validate & enrich contact. Returns a new dict with added:
       - field_validations (structured)
-      - more_details (human-readable summary)
+      - more_details is intentionally left/kept empty for user to fill
     """
     c = dict(contact)  # shallow copy
 
@@ -488,39 +494,11 @@ def classify_contact(contact: Dict[str, Any]) -> Dict[str, Any]:
         "designation": {"value": designation}
     }
 
-    # Build human-readable summary
-    parts = []
-    if name:
-        parts.append(f"Name: {name}")
-    if designation:
-        parts.append(f"Title: {designation}")
-    if company:
-        comp = company + (f" ({company_type})" if company_type else "")
-        parts.append(f"Company: {comp}")
-    if phones_parsed:
-        valid_phones = [p["normalized"] or p["raw"] for p in phones_parsed if p.get("valid")]
-        invalid_phones = [p["raw"] for p in phones_parsed if not p.get("valid")]
-        if valid_phones:
-            parts.append(f"Phones: {', '.join(valid_phones)}")
-        elif phones_parsed:
-            parts.append(f"Phones (raw): {', '.join([p['raw'] for p in phones_parsed])}")
-        if invalid_phones:
-            parts.append(f"(Note: {len(invalid_phones)} phone(s) unvalidated)")
-    if email:
-        parts.append(f"Email: {email}{'' if email_valid else ' (invalid)'}")
-    if domain:
-        parts.append(f"Website: {domain}{'' if website_valid else ' (invalid)'}")
-    if social_platforms:
-        parts.append("Socials: " + ", ".join(social_platforms))
-    if address:
-        parts.append(f"Address hint: {address_country or 'unspecified'}")
-    if notes_len > 0:
-        parts.append(f"Notes: {notes_len} chars")
-
-    more_details = " | ".join(parts) if parts else "No extra details"
-
+    # Attach validations, but keep more_details intentionally empty here:
     c["field_validations"] = field_validations
-    c["more_details"] = more_details
+    # DO NOT auto-populate "more_details" — allow user to fill in frontend.
+    if "more_details" not in c or not c.get("more_details"):
+        c["more_details"] = ""
 
     # Ensure the phone and social fields stay normalized types
     c["phone_numbers"] = phones
@@ -546,6 +524,9 @@ async def upload_card(file: UploadFile = File(...)):
         # classify & enrich before storing
         extracted = classify_contact(extracted)
 
+        # ensure more_details is empty for newly created records (user will fill later)
+        extracted["more_details"] = ""
+
         extracted["created_at"] = now_ist()
         extracted["edited_at"] = ""
 
@@ -564,6 +545,12 @@ async def create_card(payload: ContactCreate):
         # classify & enrich before insert/update
         doc = classify_contact(doc)
 
+        # If user provided more_details in payload, keep it (manual create)
+        if payload.more_details:
+            doc["more_details"] = payload.more_details
+        else:
+            doc["more_details"] = ""
+
         doc["created_at"] = now_ist()
         doc["edited_at"] = ""
 
@@ -573,6 +560,9 @@ async def create_card(payload: ContactCreate):
             if existing:
                 # merge/overwrite fields and set edited_at
                 doc["edited_at"] = now_ist()
+                # preserve existing more_details if user didn't provide one
+                if not doc.get("more_details"):
+                    doc["more_details"] = existing.get("more_details", "")
                 collection.update_one({"_id": existing["_id"]}, {"$set": doc})
                 updated = collection.find_one({"_id": existing["_id"]})
                 return {"message": "Updated existing contact", "data": JSONEncoder.encode(updated)}
@@ -614,27 +604,35 @@ def update_card(card_id: str, payload: dict = Body(...)):
         allowed_fields = {
             "name", "designation", "company", "phone_numbers",
             "email", "website", "address", "social_links",
-            "additional_notes"
+            "additional_notes", "more_details"
         }
 
         update_data = {k: v for k, v in payload.items() if k in allowed_fields}
         if not update_data:
             raise HTTPException(status_code=400, detail="No valid fields to update.")
 
-        # Re-classify the updated fields to keep field_validations & more_details current
-        # fetch existing doc, merge, classify, then update
+        # fetch existing doc
         existing = collection.find_one({"_id": ObjectId(card_id)})
         if not existing:
             raise HTTPException(status_code=404, detail="Card not found.")
 
+        # preserve existing more_details unless user explicitly provided one
+        existing_more = existing.get("more_details", "")
+
         merged = dict(existing)
         merged.update(update_data)
 
-        # classify -> returns normalized phone/socials and adds field_validations/more_details
+        # classify -> returns normalized phone/socials and adds field_validations
         merged = classify_contact(merged)
 
+        # ensure more_details: if user provided it in update_data, keep that; otherwise preserve existing
+        if "more_details" in update_data:
+            merged["more_details"] = update_data.get("more_details", "")
+        else:
+            merged["more_details"] = existing_more
+
         # pick only allowed fields + classification fields to set
-        set_payload = {k: merged.get(k) for k in list(allowed_fields) + ["field_validations", "more_details"]}
+        set_payload = {k: merged.get(k) for k in list(allowed_fields) + ["field_validations"]}
         set_payload["edited_at"] = now_ist()
 
         collection.update_one({"_id": ObjectId(card_id)}, {"$set": set_payload})
