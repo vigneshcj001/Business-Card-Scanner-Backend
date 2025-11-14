@@ -98,12 +98,12 @@ class ContactCreate(BaseModel):
         return v
 
 # -----------------------------------------
-# Utilities: improved extract_details (OCR parsing)
+# Utilities: OCR parsing + heuristics
 # -----------------------------------------
 def extract_details(text: str) -> Dict[str, Any]:
     """
-    Parse OCR text into structured contact fields with improved name/company heuristics.
-    Returns a dict with keys including more_details="" (intentionally empty for user to fill).
+    Parse OCR text into structured contact fields with heuristics.
+    more_details is intentionally initialized as an empty string so the user fills it.
     """
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     raw_text = " ".join(lines)
@@ -117,7 +117,7 @@ def extract_details(text: str) -> Dict[str, Any]:
         "website": "",
         "address": "",
         "social_links": [],
-        "more_details": "",            # start empty so user fills it in frontend
+        "more_details": "",            # user fills this later
         "additional_notes": raw_text,
     }
 
@@ -140,33 +140,27 @@ def extract_details(text: str) -> Dict[str, Any]:
         if any(s in low for s in ["linkedin", "instagram", "facebook", "twitter", "x.com", "t.me", "wa.me", "telegram"]):
             data["social_links"].append(l.strip())
 
-    # -----------------------------------------
-    # IMPROVED DESIGNATION LOGIC
-    # -----------------------------------------
+    # DESIGNATION heuristic
     designation_keywords = [
         "founder", "ceo", "cto", "coo", "manager",
         "director", "engineer", "consultant", "head", "lead",
         "president", "vp", "vice", "principal", "officer"
     ]
-
     for line in lines:
         low = line.lower()
         if any(kw in low for kw in designation_keywords):
             words = line.split()
-            limited = " ".join(words[:6])  # keep short
+            limited = " ".join(words[:6])
             clean = re.sub(r"[^A-Za-z&\s\-\./]", "", limited).strip()
             clean = re.sub(r"\b(fm|fin|fmr)\b", "", clean, flags=re.I).strip()
             data["designation"] = clean
             break
 
-    # -----------------------------------------
-    # COMPANY / NAME heuristics (conservative)
-    # -----------------------------------------
+    # COMPANY and NAME heuristics (conservative)
     company_keywords = [
         "pvt", "private", "ltd", "llp", "inc", "solutions",
         "technologies", "tech", "corporation", "company", "corp", "industries", "works", "enterprises"
     ]
-
     address_tokens = [
         "street", "st", "road", "rd", "nagar", "lane", "city", "tamilnadu", "india", "pincode",
         "pin", "near", "opp", "zip", "avenue", "av", "bldg", "building", "suite", "ste", "floor"
@@ -220,7 +214,7 @@ def extract_details(text: str) -> Dict[str, Any]:
     if company_candidates:
         data["company"] = company_candidates[0]
 
-    # Name detection
+    # NAME detection
     name_candidates = []
     for line in lines:
         clean_line = re.sub(r"^[\u00A9\u00AE©®\s\W]+", "", line).strip()
@@ -267,7 +261,7 @@ def extract_details(text: str) -> Dict[str, Any]:
                     data["name"] = cleaned
                     break
 
-    # ADDRESS heuristics (conservative)
+    # ADDRESS heuristics
     address_lines = []
     for l in lines:
         if re.search(r"\d.*(street|st|road|rd|nagar|lane|city|tamilnadu|india|pincode|pin|near|opp|zip|avenue|av|bldg|building|suite|ste|floor)", l, re.I):
@@ -275,7 +269,7 @@ def extract_details(text: str) -> Dict[str, Any]:
     if address_lines:
         data["address"] = ", ".join(address_lines)
 
-    # Trim strings and final cleanup
+    # Trim & cleanup
     for k in ["name", "designation", "company", "address", "email", "website", "more_details"]:
         if isinstance(data.get(k), str):
             data[k] = data[k].strip()
@@ -286,14 +280,14 @@ def extract_details(text: str) -> Dict[str, Any]:
     return data
 
 # -----------------------------------------
-# Helper: timestamp
+# Timestamp helper
 # -----------------------------------------
 def now_ist() -> str:
     ist = pytz.timezone("Asia/Kolkata")
     return datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
 
 # -----------------------------------------
-# Classification helper (validate & enrich)
+# Classification helpers
 # -----------------------------------------
 SOCIAL_PLATFORMS = {
     "linkedin": ["linkedin.com", "linkedin"],
@@ -383,9 +377,8 @@ def parse_phones(phone_list: List[str]) -> List[Dict[str, Any]]:
 
 def classify_contact(contact: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Validate & enrich contact. Returns a new dict with added:
-      - field_validations (structured)
-      - more_details intentionally left empty unless provided
+    Validate & enrich contact. Keeps field_validations but leaves more_details empty
+    unless provided by the caller (frontend controls it).
     """
     c = dict(contact)  # shallow copy
 
@@ -469,7 +462,7 @@ def classify_contact(contact: Dict[str, Any]) -> Dict[str, Any]:
 
     c["field_validations"] = field_validations
 
-    # Keep more_details empty unless provided in the contact dict (frontend controls this)
+    # Keep more_details empty unless provided
     if "more_details" not in c or not c.get("more_details"):
         c["more_details"] = ""
 
