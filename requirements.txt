@@ -10,3 +10,4 @@ validators
 tldextract
 spacy
 pytz
+pydantic[email]
