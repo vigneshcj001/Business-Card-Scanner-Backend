@@ -12,3 +12,5 @@ spacy
 pytz
 pydantic[email]
 python-multipart
+numpy
+opencv-python
