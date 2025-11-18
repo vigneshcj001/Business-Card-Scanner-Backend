@@ -11,10 +11,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, validator
 from pymongo import MongoClient
 from bson import ObjectId
-from PIL import Image
+from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 import pytesseract
+from pytesseract import Output
 from dotenv import load_dotenv
 import pytz
+
+# --- Additional libs for classification/validation / preprocessing ---
+import numpy as np
+import cv2
 
 # --- Additional libs for classification/validation ---
 import phonenumbers
@@ -34,6 +39,9 @@ MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME = os.getenv("DB_NAME", "business_cards")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "contacts")
 PHONE_DEFAULT_REGION = os.getenv("PHONE_DEFAULT_REGION", "IN")  # default phone region
+
+# Optional: explicitly set tesseract binary if not on PATH
+# pytesseract.pytesseract.tesseract_cmd = r"/usr/bin/tesseract"  # adjust path if necessary
 
 # FastAPI setup
 app = FastAPI(title="Business Card OCR API")
@@ -108,15 +116,58 @@ class ContactCreate(BaseModel):
         raise ValueError("email must be a valid email address or empty")
 
 # -----------------------------------------
-# Utilities: OCR parsing + heuristics
+# Utilities: OCR preprocessing + parsing + heuristics
 # -----------------------------------------
 from difflib import SequenceMatcher
+
+def preprocess_pil_image(pil_img: Image.Image, upscale: bool = True) -> Image.Image:
+    """
+    Convert to RGB, grayscale, upscale if small, denoise, adaptive threshold,
+    mild sharpening and contrast. Returns a PIL Image (binary/thresholded)
+    suitable for Tesseract.
+    """
+    # Ensure RGB then convert to numpy
+    img = pil_img.convert("RGB")
+    arr = np.array(img)
+
+    # Convert to gray
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+
+    # Optional upscale to improve OCR on small images
+    h, w = gray.shape
+    if upscale and max(h, w) < 1200:
+        scale = max(1.0, 1200.0 / max(h, w))
+        gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+
+    # Denoise (bilateral preserves edges)
+    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+
+    # Adaptive thresholding for uneven lighting
+    try:
+        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY, 31, 15)
+    except Exception:
+        # fallback to Otsu
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Morphological open (remove speckles)
+    kernel = np.ones((1, 1), np.uint8)
+    processed = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+
+    pil_proc = Image.fromarray(processed)
+
+    # Mild sharpening and contrast increase
+    pil_proc = pil_proc.filter(ImageFilter.UnsharpMask(radius=1, percent=120, threshold=3))
+    pil_proc = ImageEnhance.Contrast(pil_proc).enhance(1.15)
+
+    return pil_proc
 
 def extract_details(text: str) -> Dict[str, Any]:
     """
     OCR parsing with improved logic to avoid picking company as name.
     Prioritizes ALL-CAPS prominent lines near the top as person names and,
     if company and name collide, searches for alternatives anywhere in the card.
+    (This is your pre-existing heuristic — kept mostly unchanged.)
     """
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     raw_text = " ".join(lines)
@@ -149,14 +200,15 @@ def extract_details(text: str) -> Dict[str, Any]:
     email_m = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", raw_text)
     data["email"] = email_m.group(0) if email_m else ""
 
-    # WEBSITE
+    # WEBSITE (slightly improved pattern)
     website_m = re.search(
-        r"(https?://\S+|www\.\S+|\b(?![\w\.-]+@)[A-Za-z0-9\-]+\.(?:com|in|net|org|co|io|biz|info|xyz|me)\b)",
+        r"\b(?:https?://|www\.)[^\s,;)\]]+|\b([A-Za-z0-9\-]+\.(?:com|in|net|org|co|io|biz|info|xyz|me))\b",
         raw_text,
+        re.I,
     )
     data["website"] = website_m.group(0) if website_m else ""
 
-    # PHONES (exclude short numbers like 6-digit pincodes)
+    # PHONES (exclude very short)
     phones = re.findall(r"\+?\d[\d \-\(\)xextEXT]{6,}\d", raw_text)
     normed = []
     for p in phones:
@@ -192,7 +244,7 @@ def extract_details(text: str) -> Dict[str, Any]:
             data["designation"] = re.sub(r"\s{2,}", " ", " ".join(tokens)).strip()
             break
 
-    # COMPANY detection: prefer explicit company keywords, otherwise fallback to longer alpha line
+    # COMPANY detection
     company_candidates = []
     for idx, line in enumerate(lines):
         low = line.lower().strip()
@@ -236,8 +288,7 @@ def extract_details(text: str) -> Dict[str, Any]:
 
     def is_all_caps_word(l):
         cleaned = re.sub(r"[^A-Za-z\s]", "", l).strip()
-        # single or two word uppercase tokens, reasonable length
-        if not cleaned: 
+        if not cleaned:
             return False
         words = cleaned.split()
         if len(words) > 2:
@@ -299,7 +350,7 @@ def extract_details(text: str) -> Dict[str, Any]:
                 name_candidate = " ".join([w.capitalize() for w in cleaned.split()])
                 break
 
-    # Additional simple NAME heuristics (user-provided): prefer prominent ALL-UPPER lines anywhere
+    # Additional fallbacks...
     if not name_candidate:
         uppercase_lines = []
         for l in lines:
@@ -322,14 +373,13 @@ def extract_details(text: str) -> Dict[str, Any]:
                         name_candidate = " ".join([w.capitalize() for w in candidate_clean.split()])
                         break
 
-    # If candidate looks like the company (or equals it), attempt stronger fallbacks
+    # If candidate looks like the company, attempt alternatives
     if name_candidate:
         comp = (data.get("company") or "").strip()
         low_name = name_candidate.lower()
         low_comp = comp.lower()
         looks_like_company = any(kw in low_name for kw in company_keywords) or (low_comp and (low_comp in low_name or low_name in low_comp)) or (comp and similar(low_name, low_comp) > 0.6)
         if looks_like_company:
-            # 1) search above company_idx if available
             alt_candidate = ""
             search_limit = company_idx if company_idx is not None else min(len(lines), 6)
             for i in range(0, search_limit):
@@ -349,7 +399,6 @@ def extract_details(text: str) -> Dict[str, Any]:
                     if capitalized >= 1:
                         alt_candidate = " ".join([w.capitalize() for w in words])
                         break
-            # 2) if still not found, scan entire card for ALL-CAPS single/two-word tokens that look like a person's given name
             if not alt_candidate:
                 for i, l in enumerate(lines):
                     if re.search(r"[\w\.-]+@[\w\.-]+", l) or re.search(r"\+?\d", l):
@@ -358,9 +407,7 @@ def extract_details(text: str) -> Dict[str, Any]:
                     if any(tok in low for tok in address_tokens) or any(kw in low for kw in company_keywords):
                         continue
                     if is_all_caps_word(l):
-                        # prefer uppercase tokens that are not too brand-like (length & not containing 'solutions' etc.)
                         candidate_upper = re.sub(r"[^A-Za-z\s]", "", l).strip()
-                        # avoid picking a company-like uppercase that shares high similarity with company
                         if comp and similar(candidate_upper, comp) > 0.7:
                             continue
                         alt_candidate = candidate_upper.title()
@@ -368,7 +415,6 @@ def extract_details(text: str) -> Dict[str, Any]:
             if alt_candidate:
                 name_candidate = alt_candidate
             else:
-                # final fallback: strip company tokens from candidate and keep remainder
                 name_candidate = re.sub(r"\b(private|pvt|ltd|llp|inc|technologies|tech|works|solutions)\b", "", name_candidate, flags=re.I).strip()
 
     data["name"] = (name_candidate or "").strip()
@@ -596,21 +642,71 @@ async def upload_card(file: UploadFile = File(...)):
     try:
         content = await file.read()
         img = Image.open(io.BytesIO(content))
-        text = pytesseract.image_to_string(img)
-        extracted = extract_details(text)
+
+        # PREPROCESS + OCR (robust)
+        try:
+            proc_img = preprocess_pil_image(img, upscale=True)
+
+            # choose OCR config; psm 6 is good for a block of text, adjust for layout
+            ocr_config = "--oem 3 --psm 6"
+            raw_text = pytesseract.image_to_string(proc_img, config=ocr_config, lang='eng')
+
+            # detailed data (word-level) — gives confidence, bbox, text
+            ocr_data = pytesseract.image_to_data(proc_img, config=ocr_config, lang='eng', output_type=Output.DICT)
+
+            # build a simple confidence summary
+            confidences = []
+            for c in ocr_data.get("conf", []):
+                try:
+                    # pytesseract may output "-1" or "-1\n"
+                    conf = int(float(c))
+                    confidences.append(conf)
+                except Exception:
+                    pass
+            avg_conf = sum(confidences)/len(confidences) if confidences else None
+
+        except Exception as e:
+            logging.exception("ocr preprocessing error")
+            raise HTTPException(status_code=500, detail=f"OCR processing failed: {e}")
+
+        # Extract structured details from OCR text
+        extracted = extract_details(raw_text)
+
+        # store debug fields to help triage poor OCR results
+        extracted["_raw_ocr_text"] = raw_text
+        extracted["_ocr_avg_confidence"] = avg_conf
+        extracted["_ocr_word_count"] = len([t for t in ocr_data.get("text", []) if t and t.strip()])
+
+        # optional: store low-confidence words (capped)
+        low_conf_words = []
+        try:
+            for i, w in enumerate(ocr_data.get("text", [])):
+                if not w or not w.strip():
+                    continue
+                try:
+                    conf = int(float(ocr_data.get("conf", [])[i]))
+                except Exception:
+                    conf = -1
+                if conf >= 0 and conf < 60:
+                    low_conf_words.append({"word": w, "conf": conf})
+            extracted["_ocr_low_conf_words"] = low_conf_words[:40]
+        except Exception:
+            # non-fatal: don't block processing if this debug step fails
+            extracted["_ocr_low_conf_words"] = []
 
         # classify & enrich before storing (computes validations but leaves more_details empty)
         extracted = classify_contact(extracted)
 
         # ensure more_details is empty for newly created records (user will fill later)
         extracted["more_details"] = ""
-
         extracted["created_at"] = now_ist()
         extracted["edited_at"] = ""
 
         result = collection.insert_one(extracted)
         inserted = collection.find_one({"_id": result.inserted_id})
         return {"message": "Inserted Successfully", "data": JSONEncoder.encode(inserted)}
+    except HTTPException:
+        raise
     except Exception as e:
         logging.exception("upload_card error")
         raise HTTPException(status_code=500, detail=str(e))
