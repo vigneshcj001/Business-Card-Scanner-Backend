@@ -14,4 +14,3 @@ pydantic[email]
 python-multipart
 numpy
 opencv-python-headless
-opencv-python
