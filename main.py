@@ -8,7 +8,7 @@ from typing import List, Optional, Any, Dict
 
 from fastapi import FastAPI, File, UploadFile, Body, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr, validator
+from pydantic import BaseModel, validator
 from pymongo import MongoClient
 from bson import ObjectId
 from PIL import Image
@@ -72,7 +72,7 @@ class ContactCreate(BaseModel):
     designation: Optional[str] = ""
     company: Optional[str] = ""
     phone_numbers: Optional[List[str]] = []
-    email: Optional[str] = ""          # changed from EmailStr to Optional[str]
+    email: Optional[str] = ""          # allow empty string; validated below
     website: Optional[str] = ""
     address: Optional[str] = ""
     social_links: Optional[List[str]] = []
@@ -102,12 +102,10 @@ class ContactCreate(BaseModel):
         v = (v or "").strip()
         if v == "":
             return ""
-        try:
-            # reuse pydantic EmailStr validator to check format
-            EmailStr.validate(v)
+        # Use validators package to check email format; clearer error reporting
+        if validators.email(v):
             return v
-        except Exception:
-            raise ValueError("email must be a valid email address or empty")
+        raise ValueError("email must be a valid email address or empty")
 
 # -----------------------------------------
 # Utilities: OCR parsing + heuristics
