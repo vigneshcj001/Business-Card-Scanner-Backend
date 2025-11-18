@@ -1,8 +1,10 @@
+# File: main.py (FastAPI backend)
 import os
 import io
 import re
+import logging
 from datetime import datetime
-from typing import List, Optional, Any, Dict, Tuple
+from typing import List, Optional, Any, Dict
 
 from fastapi import FastAPI, File, UploadFile, Body, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +15,6 @@ from PIL import Image
 import pytesseract
 from dotenv import load_dotenv
 import pytz
-import logging
 
 # --- Additional libs for classification/validation ---
 import phonenumbers
@@ -71,7 +72,7 @@ class ContactCreate(BaseModel):
     designation: Optional[str] = ""
     company: Optional[str] = ""
     phone_numbers: Optional[List[str]] = []
-    email: Optional[EmailStr] = ""
+    email: Optional[str] = ""          # changed from EmailStr to Optional[str]
     website: Optional[str] = ""
     address: Optional[str] = ""
     social_links: Optional[List[str]] = []
@@ -95,6 +96,18 @@ class ContactCreate(BaseModel):
             items = [x.strip() for x in v.split(",") if x.strip()]
             return items
         return v
+
+    @validator("email", pre=True, always=True)
+    def empty_or_valid_email(cls, v):
+        v = (v or "").strip()
+        if v == "":
+            return ""
+        try:
+            # reuse pydantic EmailStr validator to check format
+            EmailStr.validate(v)
+            return v
+        except Exception:
+            raise ValueError("email must be a valid email address or empty")
 
 # -----------------------------------------
 # Utilities: OCR parsing + heuristics
@@ -380,7 +393,6 @@ def extract_details(text: str) -> Dict[str, Any]:
 
     return data
 
-
 # -----------------------------------------
 # Timestamp helper
 # -----------------------------------------
@@ -575,7 +587,7 @@ def classify_contact(contact: Dict[str, Any]) -> Dict[str, Any]:
     return c
 
 # -----------------------------------------
-# Routes (unchanged)
+# Routes
 # -----------------------------------------
 @app.get("/")
 def root():
