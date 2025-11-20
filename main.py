@@ -1,4 +1,3 @@
-# backend.py
 import os
 import io
 import re
@@ -14,18 +13,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pymongo import MongoClient
 from bson import ObjectId
-from PIL import Image, ImageOps
+from PIL import Image
 import pytesseract
 
 # OpenAI client (required)
 from openai import OpenAI
 
 # -----------------------
-# Requirements:
-# pip install fastapi uvicorn python-multipart pillow pytesseract pymongo openai
-# Tesseract binary must be installed on host (apt / brew / Windows installer).
+# Logging & config
 # -----------------------
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("business-card-backend")
 
@@ -42,10 +38,18 @@ if TESSERACT_PATH:
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 
 # -----------------------
-# Helpers & normalization
+# Small helpers
 # -----------------------
 def now_iso() -> str:
     return datetime.utcnow().isoformat() + "Z"
+
+
+def safe_objectid(oid: str) -> ObjectId:
+    try:
+        return ObjectId(oid)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid object id")
+
 
 def _ensure_list(v) -> List[str]:
     if v is None:
@@ -62,10 +66,12 @@ def _ensure_list(v) -> List[str]:
     except Exception:
         return []
 
+
 def clean_ocr_text(text: str) -> str:
     text = re.sub(r"\r", "\n", text)
     text = re.sub(r"\n{2,}", "\n", text)
     return text.strip()
+
 
 def normalize_payload(payload: dict) -> dict:
     out = {}
@@ -80,6 +86,7 @@ def normalize_payload(payload: dict) -> dict:
     out["more_details"] = payload.get("more_details") or ""
     out["additional_notes"] = payload.get("additional_notes") or ""
     return out
+
 
 def db_doc_to_canonical(doc: dict) -> dict:
     if not doc:
@@ -100,16 +107,11 @@ def db_doc_to_canonical(doc: dict) -> dict:
         "edited_at": doc.get("edited_at"),
         "field_validations": doc.get("field_validations", {}),
     }
-    if "raw_text" in doc:
-        canonical["raw_text"] = doc.get("raw_text")
-    if "confidence_notes" in doc:
-        canonical["confidence_notes"] = doc.get("confidence_notes")
-    if "extra" in doc:
-        canonical["extra"] = doc.get("extra")
+    # NOTE: intentionally **not** exposing raw_text, confidence_notes, extra here.
     return canonical
 
 # -----------------------
-# Local regex-based extractor (improved)
+# Local regex-based extractor
 # -----------------------
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", re.I)
 
@@ -122,9 +124,6 @@ WWW_RE = re.compile(
     re.I,
 )
 
-COMPANY_HINTS = [
-    r"\b(Ltd|Pvt|Private|LLP|Limited|Inc|Corporation|Company|Technologies|Tech|Solutions|Works|Consultants|Advisory|Group|Systems|Enterprises|Industries)\b"
-]
 
 def _normalize_phone_string(p: str) -> str:
     if not p:
@@ -136,6 +135,7 @@ def _normalize_phone_string(p: str) -> str:
         return "+" + digits
     return digits
 
+
 def _dedupe_keep_order(seq):
     seen = set()
     out = []
@@ -146,6 +146,7 @@ def _dedupe_keep_order(seq):
             seen.add(x)
             out.append(x)
     return out
+
 
 def local_parse_from_ocr(ocr_text: str) -> Tuple[Dict[str, Any], str]:
     parsed = {
@@ -206,10 +207,24 @@ def local_parse_from_ocr(ocr_text: str) -> Tuple[Dict[str, Any], str]:
         if EMAIL_RE.search(s) or WWW_RE.search(s) or PHONE_RE.search(s):
             return False
         low = s.lower()
-        bad_words = ("ltd", "pvt", "private", "company", "technologies", "solutions", "consultants", "inc", "www", "http", "co.", "group", "llp")
+        bad_words = (
+            "ltd",
+            "pvt",
+            "private",
+            "company",
+            "technologies",
+            "solutions",
+            "consultants",
+            "inc",
+            "www",
+            "http",
+            "co.",
+            "group",
+            "llp",
+        )
         if any(w in low for w in bad_words):
             return False
-        if re.search(r"\b(CEO|Founder|Director|Partner|Manager|Consultant|Officer|Advisory|Placement|Head|Chief|Executive|Officer)\b", s, re.I):
+        if re.search(r"\b(CEO|Founder|Director|Partner|Manager|Consultant|Officer|Advisory|Head|Chief|Executive)\b", s, re.I):
             return False
         words = s.split()
         if len(words) > 6:
@@ -235,8 +250,8 @@ def local_parse_from_ocr(ocr_text: str) -> Tuple[Dict[str, Any], str]:
     if parsed["name"]:
         try:
             idx = lines.index(parsed["name"])
-            for ln in lines[idx + 1: idx + 5]:
-                if re.search(r"\b(Founder|CEO|Director|Manager|Partner|Consultant|Officer|Advisory|Placement|Head|Chief|Executive|Officer|Placement Officer)\b", ln, re.I):
+            for ln in lines[idx + 1 : idx + 5]:
+                if re.search(r"\b(Founder|CEO|Director|Manager|Partner|Consultant|Officer|Advisory|Head|Chief|Executive)\b", ln, re.I):
                     parsed["title"] = ln
                     break
         except ValueError:
@@ -245,13 +260,17 @@ def local_parse_from_ocr(ocr_text: str) -> Tuple[Dict[str, Any], str]:
     # Company
     company_candidate = None
     for ln in lines:
-        if re.search(r"\b(Ltd|Pvt|Private|LLP|Limited|Inc|Corporation|Company|Technologies|Tech|Solutions|Works|Consultants|Advisory|Group|Systems|Enterprises|Industries)\b", ln, re.I):
+        if re.search(
+            r"\b(Ltd|Pvt|Private|LLP|Limited|Inc|Corporation|Company|Technologies|Tech|Solutions|Works|Consultants|Advisory|Group|Systems|Enterprises|Industries)\b",
+            ln,
+            re.I,
+        ):
             company_candidate = ln
             break
     if not company_candidate and parsed["name"]:
         try:
             idx = lines.index(parsed["name"])
-            for cand in lines[idx + 1: idx + 3]:
+            for cand in lines[idx + 1 : idx + 3]:
                 if len(cand.split()) <= 6 and not EMAIL_RE.search(cand) and not PHONE_RE.search(cand):
                     company_candidate = cand
                     break
@@ -261,7 +280,25 @@ def local_parse_from_ocr(ocr_text: str) -> Tuple[Dict[str, Any], str]:
 
     # Address guess
     addresses = []
-    addr_tokens = ("road", "rd", "street", "st", "bengaluru", "bangalore", "kolhapur", "mumbai", "coimbatore", "address", "city", "block", "floor", "lane", "near", "plot", "sector", "outer ring")
+    addr_tokens = (
+        "road",
+        "rd",
+        "street",
+        "st",
+        "bengaluru",
+        "bangalore",
+        "mumbai",
+        "coimbatore",
+        "address",
+        "city",
+        "block",
+        "floor",
+        "lane",
+        "near",
+        "plot",
+        "sector",
+        "outer ring",
+    )
     for ln in lines[-8:]:
         low = ln.lower()
         if len(ln) > 30 or any(tok in low for tok in addr_tokens) or re.search(r"\b\d{5,6}\b", ln):
@@ -303,6 +340,7 @@ PARSER_PROMPT = (
     "Respond ONLY with the JSON object.\n"
 )
 
+
 def call_openai_parse(ocr_text: str, api_key: str, model: str = "gpt-4o") -> Dict[str, Any]:
     if not api_key:
         raise RuntimeError("OpenAI API key is required for parsing.")
@@ -313,7 +351,7 @@ def call_openai_parse(ocr_text: str, api_key: str, model: str = "gpt-4o") -> Dic
             model=model,
             messages=[
                 {"role": "system", "content": "You are a JSON-only extractor."},
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": prompt},
             ],
             temperature=0.0,
             max_tokens=512,
@@ -329,7 +367,7 @@ def call_openai_parse(ocr_text: str, api_key: str, model: str = "gpt-4o") -> Dic
             "website": None,
             "address": None,
             "extra": {"openai_error": str(e), "traceback": traceback.format_exc()},
-            "confidence_notes": f"OpenAI call failed: {e}"
+            "confidence_notes": f"OpenAI call failed: {e}",
         }
 
     try:
@@ -337,6 +375,7 @@ def call_openai_parse(ocr_text: str, api_key: str, model: str = "gpt-4o") -> Dic
     except Exception:
         assistant_text = str(resp)
 
+    # attempted robust JSON parse
     try:
         parsed = json.loads(assistant_text)
         return parsed
@@ -356,7 +395,7 @@ def call_openai_parse(ocr_text: str, api_key: str, model: str = "gpt-4o") -> Dic
             "website": None,
             "address": None,
             "extra": {"model_output": assistant_text},
-            "confidence_notes": "Model output not parseable as JSON. See extra.model_output."
+            "confidence_notes": "Model output not parseable as JSON. See extra.model_output.",
         }
 
 # -----------------------
@@ -364,12 +403,8 @@ def call_openai_parse(ocr_text: str, api_key: str, model: str = "gpt-4o") -> Dic
 # -----------------------
 app = FastAPI(title="Business Card OCR Backend (OpenAI required + MongoDB)")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
 
 class ContactBase(BaseModel):
     name: Optional[str] = None
@@ -383,14 +418,16 @@ class ContactBase(BaseModel):
     more_details: Optional[str] = ""
     additional_notes: Optional[str] = ""
 
+
 class ExtractedContact(ContactBase):
-    raw_text: Optional[str] = None
-    confidence_notes: Optional[str] = None
-    extra: Optional[Dict[str, Any]] = None
+    # intentionally minimal: do not include raw_text, confidence_notes, extra
+    pass
+
 
 @app.get("/ping")
 async def ping():
     return {"status": "ok", "time": now_iso()}
+
 
 @app.post("/extract", response_model=ExtractedContact)
 async def extract_card(file: UploadFile = File(...), authorization: Optional[str] = Header(None), model: Optional[str] = "gpt-4o"):
@@ -414,6 +451,7 @@ async def extract_card(file: UploadFile = File(...), authorization: Optional[str
         logger.exception("Invalid image uploaded")
         return JSONResponse(status_code=400, content={"detail": f"Invalid image: {e}", "traceback": traceback.format_exc()})
 
+    # resize if huge
     try:
         max_dim = 1800
         if max(image.size) > max_dim:
@@ -437,16 +475,18 @@ async def extract_card(file: UploadFile = File(...), authorization: Optional[str
     openai_parsed = call_openai_parse(raw_text_clean, api_key=api_key, model=model)
 
     # Merge: prefer OpenAI value if present, otherwise local
-    merged = {}
-    def pick(key):
-        v = openai_parsed.get(key)
+    def pick(openai_key: str, local_key: str = None):
+        v = openai_parsed.get(openai_key)
         if v is not None and v != "":
             return v
-        return local_parsed.get(key)
+        if local_key:
+            return local_parsed.get(local_key)
+        return local_parsed.get(openai_key)
 
-    merged["name"] = pick("name")
-    merged["designation"] = pick("title") or pick("designation")
-    merged["company"] = pick("company")
+    merged = {}
+    merged["name"] = pick("name", "name")
+    merged["designation"] = pick("title", "title") or pick("designation", "designation")
+    merged["company"] = pick("company", "company")
 
     # Phones: handle string vs list and local extras
     phones_candidate = None
@@ -457,12 +497,11 @@ async def extract_card(file: UploadFile = File(...), authorization: Optional[str
             break
     if not phones_candidate:
         phones_candidate = local_parsed.get("extra", {}).get("phones_all") or local_parsed.get("phone")
-
     merged["phone_numbers"] = _ensure_list(phones_candidate)
 
-    merged["email"] = pick("email")
-    merged["website"] = pick("website")
-    merged["address"] = pick("address")
+    merged["email"] = pick("email", "email")
+    merged["website"] = pick("website", "website")
+    merged["address"] = pick("address", "address")
 
     social_candidate = None
     for k in ("social_links", "linkedin"):
@@ -485,12 +524,15 @@ async def extract_card(file: UploadFile = File(...), authorization: Optional[str
         cn.append(f"local:{local_parsed.get('confidence_notes')}")
     merged["confidence_notes"] = ";".join(cn) if cn else "none"
 
-    merged["extra"] = {
-        "local": local_parsed.get("extra", {}),
-        "openai": openai_parsed.get("extra", {}),
-    }
+    merged["extra"] = {"local": local_parsed.get("extra", {}), "openai": openai_parsed.get("extra", {})}
 
-    return JSONResponse(status_code=200, content=merged)
+    # Sanitize response: do not expose raw_text, confidence_notes, extra to the UI
+    sanitized = dict(merged)
+    for remove_key in ("confidence_notes", "extra", "raw_text"):
+        sanitized.pop(remove_key, None)
+
+    return JSONResponse(status_code=200, content=sanitized)
+
 
 @app.post("/vcard")
 async def vcard_endpoint(payload: ContactBase = Body(...)):
@@ -506,9 +548,8 @@ async def vcard_endpoint(payload: ContactBase = Body(...)):
         "address": payload_dict.get("address"),
     }
     vcard = generate_vcard(vcard_data)
-    return StreamingResponse(io.BytesIO(vcard.encode("utf-8")),
-                             media_type="text/vcard",
-                             headers={"Content-Disposition": "attachment; filename=contact.vcf"})
+    return StreamingResponse(io.BytesIO(vcard.encode("utf-8")), media_type="text/vcard", headers={"Content-Disposition": "attachment; filename=contact.vcf"})
+
 
 @app.post("/create_card", status_code=status.HTTP_201_CREATED)
 async def create_card(payload: ContactBase = Body(...)):
@@ -536,6 +577,7 @@ async def create_card(payload: ContactBase = Body(...)):
         logger.exception("create_card error")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/all_cards")
 def get_all_cards():
     try:
@@ -546,49 +588,56 @@ def get_all_cards():
         logger.exception("get_all_cards error")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.put("/update_notes/{card_id}")
 def update_notes(card_id: str, payload: dict = Body(...)):
     try:
         ts = now_iso()
-        update_payload = {
-            "additional_notes": payload.get("additional_notes", ""),
-            "edited_at": ts
-        }
-        collection.update_one({"_id": ObjectId(card_id)}, {"$set": update_payload})
-        updated = collection.find_one({"_id": ObjectId(card_id)})
+        update_payload = {"additional_notes": payload.get("additional_notes", ""), "edited_at": ts}
+        oid = safe_objectid(card_id)
+        collection.update_one({"_id": oid}, {"$set": update_payload})
+        updated = collection.find_one({"_id": oid})
         return {"message": "Updated", "data": db_doc_to_canonical(updated)}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("update_notes error")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.patch("/update_card/{card_id}")
 def update_card(card_id: str, payload: dict = Body(...)):
     try:
         allowed_fields = {
-            "name", "designation", "company", "phone_numbers",
-            "email", "website", "address", "social_links",
-            "additional_notes", "more_details"
+            "name",
+            "designation",
+            "company",
+            "phone_numbers",
+            "email",
+            "website",
+            "address",
+            "social_links",
+            "additional_notes",
+            "more_details",
         }
-        # Normalize incoming payload (strings -> lists etc.)
         normalized = normalize_payload(payload)
-        # Keep only allowed fields that the client actually sent (and that are not None or empty strings).
-        # Note: empty lists are allowed and will clear the field intentionally.
+        # Keep only allowed fields that the client actually sent (and that are not None or empty strings)
         update_data = {
-            k: v for k, v in normalized.items()
+            k: v
+            for k, v in normalized.items()
             if k in allowed_fields and not (v is None or (isinstance(v, str) and v.strip() == ""))
         }
         if not update_data:
             raise HTTPException(status_code=400, detail="No valid fields to update.")
 
-        # Ensure the card exists
-        existing = collection.find_one({"_id": ObjectId(card_id)})
+        oid = safe_objectid(card_id)
+        existing = collection.find_one({"_id": oid})
         if not existing:
             raise HTTPException(status_code=404, detail="Card not found.")
 
-        # Set edited_at and update only the changed fields
         update_data["edited_at"] = now_iso()
-        collection.update_one({"_id": ObjectId(card_id)}, {"$set": update_data})
-        updated = collection.find_one({"_id": ObjectId(card_id)})
+        collection.update_one({"_id": oid}, {"$set": update_data})
+        updated = collection.find_one({"_id": oid})
         return {"message": "Updated", "data": db_doc_to_canonical(updated)}
     except HTTPException:
         raise
@@ -596,20 +645,25 @@ def update_card(card_id: str, payload: dict = Body(...)):
         logger.exception("update_card error")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.delete("/delete_card/{card_id}", status_code=status.HTTP_200_OK)
 def delete_card(card_id: str):
     try:
-        result = collection.delete_one({"_id": ObjectId(card_id)})
+        oid = safe_objectid(card_id)
+        result = collection.delete_one({"_id": oid})
         if result.deleted_count == 1:
             return {"message": "Deleted"}
         else:
             raise HTTPException(status_code=404, detail="Card not found.")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("delete_card error")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 # -----------------------
-# vCard helper (placed after endpoints for clarity)
+# vCard helper
 # -----------------------
 def generate_vcard(data: Dict[str, Optional[str]]) -> str:
     lines = ["BEGIN:VCARD", "VERSION:3.0"]
