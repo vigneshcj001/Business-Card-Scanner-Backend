@@ -394,6 +394,7 @@ async def ping():
 
 @app.post("/extract", response_model=ExtractedContact)
 async def extract_card(file: UploadFile = File(...), authorization: Optional[str] = Header(None), model: Optional[str] = "gpt-4o"):
+    # require api key via header or env
     api_key = None
     if authorization and authorization.lower().startswith("bearer "):
         api_key = authorization.split(" ", 1)[1].strip()
@@ -568,19 +569,25 @@ def update_card(card_id: str, payload: dict = Body(...)):
             "email", "website", "address", "social_links",
             "additional_notes", "more_details"
         }
+        # Normalize incoming payload (strings -> lists etc.)
         normalized = normalize_payload(payload)
-        update_data = {k: v for k, v in normalized.items() if k in allowed_fields}
+        # Keep only allowed fields that the client actually sent (and that are not None or empty strings).
+        # Note: empty lists are allowed and will clear the field intentionally.
+        update_data = {
+            k: v for k, v in normalized.items()
+            if k in allowed_fields and not (v is None or (isinstance(v, str) and v.strip() == ""))
+        }
         if not update_data:
             raise HTTPException(status_code=400, detail="No valid fields to update.")
 
+        # Ensure the card exists
         existing = collection.find_one({"_id": ObjectId(card_id)})
         if not existing:
             raise HTTPException(status_code=404, detail="Card not found.")
 
-        merged = dict(existing)
-        merged.update(update_data)
-        merged["edited_at"] = now_iso()
-        collection.update_one({"_id": ObjectId(card_id)}, {"$set": merged})
+        # Set edited_at and update only the changed fields
+        update_data["edited_at"] = now_iso()
+        collection.update_one({"_id": ObjectId(card_id)}, {"$set": update_data})
         updated = collection.find_one({"_id": ObjectId(card_id)})
         return {"message": "Updated", "data": db_doc_to_canonical(updated)}
     except HTTPException:
