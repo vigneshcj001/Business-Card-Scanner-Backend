@@ -17,6 +17,9 @@ from bson import ObjectId
 from PIL import Image, ImageOps
 import pytesseract
 
+# OpenAI client (required)
+from openai import OpenAI
+
 # -----------------------
 # Requirements:
 # pip install fastapi uvicorn python-multipart pillow pytesseract pymongo openai
@@ -37,12 +40,6 @@ collection = db[COLLECTION_NAME]
 TESSERACT_PATH = os.getenv("TESSERACT_PATH")
 if TESSERACT_PATH:
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
-
-# Optional OpenAI client (only if you install and configure openai)
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
 
 # -----------------------
 # Helpers & normalization
@@ -112,21 +109,45 @@ def db_doc_to_canonical(doc: dict) -> dict:
     return canonical
 
 # -----------------------
-# Local regex-based extractor (fallback / augmentation)
+# Local regex-based extractor (improved)
 # -----------------------
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", re.I)
-PHONE_RE = re.compile(r"(?:\+?\d{1,3}[\s.-])?(?:\(?\d{2,4}\)?[\s.-])?\d{3,4}[\s.-]?\d{3,4}")
-WWW_RE = re.compile(r"(?:https?://)?(?:www\.)?[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?:/[^\s]*)?", re.I)
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", re.I)
+
+PHONE_RE = re.compile(
+    r"(?:\+?\d{1,3}[\s\-.])?(?:\(?\d{2,4}\)?[\s\-.])?(?:\d{2,4}[\s\-.]?){1,4}\d{2,4}"
+)
+
+WWW_RE = re.compile(
+    r"(https?://[^\s,;]+|www\.[^\s,;]+|[A-Za-z0-9.-]+\.(?:com|net|org|io|in|co|ai|tech|dev|biz|info)(?:/[^\s,;]*)?)",
+    re.I,
+)
 
 COMPANY_HINTS = [
-    r"\b(Ltd|Pvt|Private|LLP|Limited|Inc|Corporation|Company|Technologies|Tech|Solutions|Works|Consultants|Advisory|Group|Systems)\b"
+    r"\b(Ltd|Pvt|Private|LLP|Limited|Inc|Corporation|Company|Technologies|Tech|Solutions|Works|Consultants|Advisory|Group|Systems|Enterprises|Industries)\b"
 ]
 
+def _normalize_phone_string(p: str) -> str:
+    if not p:
+        return ""
+    p = p.strip()
+    plus = p.startswith("+")
+    digits = re.sub(r"[^\d]", "", p)
+    if plus:
+        return "+" + digits
+    return digits
+
+def _dedupe_keep_order(seq):
+    seen = set()
+    out = []
+    for x in seq:
+        if not x:
+            continue
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
 def local_parse_from_ocr(ocr_text: str) -> Tuple[Dict[str, Any], str]:
-    """
-    Returns (parsed_dict, confidence_notes)
-    parsed_dict keys: name, company, title, email, phone, website, address, extra
-    """
     parsed = {
         "name": None,
         "company": None,
@@ -140,114 +161,119 @@ def local_parse_from_ocr(ocr_text: str) -> Tuple[Dict[str, Any], str]:
     }
 
     lines = [ln.strip() for ln in ocr_text.splitlines() if ln.strip()]
-    # Extract emails
+
+    # Emails
     emails = EMAIL_RE.findall(ocr_text)
     if emails:
-        parsed["email"] = emails[0].strip()
-        parsed["extra"]["emails_all"] = emails
+        emails_clean = [e.strip().rstrip(".,;") for e in emails]
+        parsed["extra"]["emails_all"] = emails_clean
+        parsed["email"] = emails_clean[0]
 
-    # Extract websites
+    # Websites
     wwws = WWW_RE.findall(ocr_text)
     if wwws:
         wwws_clean = []
         for w in wwws:
-            w = w.strip().rstrip(".,;")
             if "@" in w:
                 continue
+            w = w.strip().rstrip(".,;")
+            if w.lower().startswith("www."):
+                w = "http://" + w
             wwws_clean.append(w)
         if wwws_clean:
-            parsed["website"] = wwws_clean[0]
-            parsed["extra"]["websites_all"] = wwws_clean
+            parsed["extra"]["websites_all"] = _dedupe_keep_order(w for w in wwws_clean)
+            parsed["website"] = parsed["extra"]["websites_all"][0]
 
-    # Extract phone numbers: regex picks many false positives; filter by length
+    # Phones
     phones_raw = PHONE_RE.findall(ocr_text)
     phones = []
-    # PHONE_RE.findall returns matches as strings (or tuples depending on groups) — normalize:
     if phones_raw:
         for m in phones_raw:
-            if isinstance(m, tuple):
-                p = "".join(m)
-            else:
-                p = m
-            p_clean = re.sub(r"[^\d\+]", "", p)
-            if 7 <= len(p_clean) <= 15:
-                phones.append(p_clean)
+            p = m if isinstance(m, str) else "".join(m)
+            p_norm = _normalize_phone_string(p)
+            digits_only = re.sub(r"[^\d]", "", p_norm)
+            if 7 <= len(digits_only) <= 15:
+                phones.append(p_norm)
     if phones:
-        parsed["phone"] = phones[0]
+        phones = _dedupe_keep_order(phones)
         parsed["extra"]["phones_all"] = phones
+        parsed["phone"] = phones[0]
 
-    # Guess name:
+    # Name heuristics
+    def looks_like_name(s: str) -> bool:
+        if not s or len(s) < 2 or len(s) > 40:
+            return False
+        if EMAIL_RE.search(s) or WWW_RE.search(s) or PHONE_RE.search(s):
+            return False
+        low = s.lower()
+        bad_words = ("ltd", "pvt", "private", "company", "technologies", "solutions", "consultants", "inc", "www", "http", "co.", "group", "llp")
+        if any(w in low for w in bad_words):
+            return False
+        if re.search(r"\b(CEO|Founder|Director|Partner|Manager|Consultant|Officer|Advisory|Placement|Head|Chief|Executive|Officer)\b", s, re.I):
+            return False
+        words = s.split()
+        if len(words) > 6:
+            return False
+        alpha_ratio = sum(c.isalpha() for c in s) / max(1, len(s))
+        if s.isupper() and alpha_ratio > 0.6:
+            return False
+        if alpha_ratio < 0.4:
+            return False
+        title_like = sum(1 for w in words if w and w[0].isupper())
+        if title_like >= 1:
+            return True
+        return False
+
     name_candidate = None
-    for i, ln in enumerate(lines[:6]):  # only look at top few lines
-        if len(ln) < 2:
-            continue
-        if EMAIL_RE.search(ln) or WWW_RE.search(ln):
-            continue
-        words = ln.split()
-        alpha_ratio = sum(c.isalpha() for c in ln) / max(1, len(ln))
-        if 1 <= len(words) <= 4 and alpha_ratio > 0.5:
-            if not re.search(r"\b(CEO|Founder|Director|Partner|Manager|Consultant|LLP|Pvt|Ltd|Inc|Company|Technologies)\b", ln, re.I):
-                name_candidate = ln
-                break
-    if name_candidate:
-        parsed["name"] = name_candidate
+    for ln in lines[:6]:
+        if looks_like_name(ln):
+            name_candidate = ln
+            break
+    parsed["name"] = name_candidate
 
-    # Guess title: look after name for short lines with caps / known titles
+    # Title
     if parsed["name"]:
         try:
             idx = lines.index(parsed["name"])
-            for ln in lines[idx+1: idx+4]:
-                if re.search(r"\b(Founder|CEO|Director|Manager|Partner|Consultant|Officer|Advisory|Placement|Head|Chief)\b", ln, re.I):
+            for ln in lines[idx + 1: idx + 5]:
+                if re.search(r"\b(Founder|CEO|Director|Manager|Partner|Consultant|Officer|Advisory|Placement|Head|Chief|Executive|Officer|Placement Officer)\b", ln, re.I):
                     parsed["title"] = ln
                     break
         except ValueError:
             pass
 
-    # Guess company: prefer line containing company hints, else line after name if it looks like company
+    # Company
     company_candidate = None
     for ln in lines:
-        for hint_re in COMPANY_HINTS:
-            if re.search(hint_re, ln, re.I):
-                company_candidate = ln
-                break
-        if company_candidate:
+        if re.search(r"\b(Ltd|Pvt|Private|LLP|Limited|Inc|Corporation|Company|Technologies|Tech|Solutions|Works|Consultants|Advisory|Group|Systems|Enterprises|Industries)\b", ln, re.I):
+            company_candidate = ln
             break
     if not company_candidate and parsed["name"]:
         try:
             idx = lines.index(parsed["name"])
-            if idx+1 < len(lines):
-                cand = lines[idx+1]
-                if len(cand.split()) <= 6 and any(c.isalpha() for c in cand):
-                    if not EMAIL_RE.search(cand) and not PHONE_RE.search(cand):
-                        company_candidate = cand
+            for cand in lines[idx + 1: idx + 3]:
+                if len(cand.split()) <= 6 and not EMAIL_RE.search(cand) and not PHONE_RE.search(cand):
+                    company_candidate = cand
+                    break
         except ValueError:
             pass
-    if company_candidate:
-        parsed["company"] = company_candidate
+    parsed["company"] = company_candidate
 
-    # Address guess: search for long lines with digits and common address keywords
+    # Address guess
     addresses = []
-    for ln in lines:
-        if len(ln) > 30 and re.search(r"\d", ln) and ("," in ln or "Road" in ln or "Street" in ln or "Bengaluru" in ln or "Bangalore" in ln or "Kolhapur" in ln or "Coimbatore" in ln):
+    addr_tokens = ("road", "rd", "street", "st", "bengaluru", "bangalore", "kolhapur", "mumbai", "coimbatore", "address", "city", "block", "floor", "lane", "near", "plot", "sector", "outer ring")
+    for ln in lines[-8:]:
+        low = ln.lower()
+        if len(ln) > 30 or any(tok in low for tok in addr_tokens) or re.search(r"\b\d{5,6}\b", ln):
             addresses.append(ln)
     if addresses:
-        parsed["address"] = " | ".join(addresses[:2])
+        parsed["address"] = " | ".join(addresses[:3])
     else:
-        addr_lines = []
-        for ln in lines[-6:]:
-            if any(keyword in ln.lower() for keyword in ("road", "rd", "street", "st", "bengaluru", "bangalore", "kolhapur", "mumbai", "coimbatore", "address", "city", "block", "floor")) or re.search(r"\d{5,6}", ln):
-                addr_lines.append(ln)
-        if addr_lines:
-            parsed["address"] = ", ".join(addr_lines)
-
-    # If we found nothing for name, last resort: first decent alphabetic line
-    if not parsed["name"]:
-        for ln in lines[:6]:
-            if len(ln.split()) <= 4 and sum(c.isalpha() for c in ln) / max(1, len(ln)) > 0.5:
-                parsed["name"] = ln
+        for ln in lines:
+            if re.search(r"\b\d{5,6}\b", ln):
+                parsed["address"] = ln
                 break
 
-    # confidence notes summarizing what we found
     notes = []
     if parsed.get("email"):
         notes.append("email_ok")
@@ -268,7 +294,7 @@ def local_parse_from_ocr(ocr_text: str) -> Tuple[Dict[str, Any], str]:
     return parsed, parsed["confidence_notes"]
 
 # -----------------------
-# OpenAI parsing wrapper
+# OpenAI parsing wrapper (required)
 # -----------------------
 PARSER_PROMPT = (
     "You are an assistant that extracts structured contact fields from messy OCR'd text from a business card.\n"
@@ -278,23 +304,39 @@ PARSER_PROMPT = (
 )
 
 def call_openai_parse(ocr_text: str, api_key: str, model: str = "gpt-4o") -> Dict[str, Any]:
-    if OpenAI is None:
-        raise RuntimeError("openai package not installed (pip install openai)")
+    if not api_key:
+        raise RuntimeError("OpenAI API key is required for parsing.")
     client = OpenAI(api_key=api_key)
     prompt = PARSER_PROMPT + "\nOCR_TEXT:\n" + ocr_text + "\n\nRespond with JSON only."
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": "You are a JSON-only extractor."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.0,
-        max_tokens=512,
-    )
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a JSON-only extractor."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.0,
+            max_tokens=512,
+        )
+    except Exception as e:
+        logger.exception("OpenAI API call failed")
+        return {
+            "name": None,
+            "company": None,
+            "title": None,
+            "email": None,
+            "phone": None,
+            "website": None,
+            "address": None,
+            "extra": {"openai_error": str(e), "traceback": traceback.format_exc()},
+            "confidence_notes": f"OpenAI call failed: {e}"
+        }
+
     try:
         assistant_text = resp.choices[0].message.content.strip()
     except Exception:
         assistant_text = str(resp)
+
     try:
         parsed = json.loads(assistant_text)
         return parsed
@@ -317,42 +359,10 @@ def call_openai_parse(ocr_text: str, api_key: str, model: str = "gpt-4o") -> Dic
             "confidence_notes": "Model output not parseable as JSON. See extra.model_output."
         }
 
-def call_openai_parse_safe(ocr_text: str, api_key: Optional[str], model: str = "gpt-4o") -> Dict[str, Any]:
-    """
-    Try OpenAI if available+key; otherwise return minimal parsed dict.
-    """
-    if OpenAI is None or not api_key:
-        return {
-            "name": None,
-            "company": None,
-            "title": None,
-            "email": None,
-            "phone": None,
-            "website": None,
-            "address": None,
-            "extra": {"note": "OpenAI not available; local parse used."},
-            "confidence_notes": "No OpenAI parsing performed."
-        }
-    try:
-        return call_openai_parse(ocr_text, api_key=api_key, model=model)
-    except Exception as e:
-        logger.exception("OpenAI parsing failed")
-        return {
-            "name": None,
-            "company": None,
-            "title": None,
-            "email": None,
-            "phone": None,
-            "website": None,
-            "address": None,
-            "extra": {"openai_error": str(e), "traceback": traceback.format_exc()},
-            "confidence_notes": f"OpenAI parse failed: {e}"
-        }
-
 # -----------------------
 # FastAPI + endpoints
 # -----------------------
-app = FastAPI(title="Business Card OCR Backend (with local parser + MongoDB)")
+app = FastAPI(title="Business Card OCR Backend (OpenAI required + MongoDB)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -384,14 +394,14 @@ async def ping():
 
 @app.post("/extract", response_model=ExtractedContact)
 async def extract_card(file: UploadFile = File(...), authorization: Optional[str] = Header(None), model: Optional[str] = "gpt-4o"):
-    """
-    Upload image -> OCR -> local parse -> (optional OpenAI parse) -> merge -> return structured fields.
-    """
     api_key = None
     if authorization and authorization.lower().startswith("bearer "):
         api_key = authorization.split(" ", 1)[1].strip()
     if not api_key:
         api_key = os.getenv("OPENAI_API_KEY")
+
+    if not api_key:
+        raise HTTPException(status_code=401, detail="OpenAI API key required. Provide via Authorization: Bearer <KEY> header or OPENAI_API_KEY environment variable.")
 
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image (jpg/png/etc)")
@@ -422,8 +432,8 @@ async def extract_card(file: UploadFile = File(...), authorization: Optional[str
     # local parse (always)
     local_parsed, local_notes = local_parse_from_ocr(raw_text_clean)
 
-    # try OpenAI parse (may return minimal if OpenAI unavailable)
-    openai_parsed = call_openai_parse_safe(raw_text_clean, api_key=api_key, model=model)
+    # REQUIRED: call OpenAI parser
+    openai_parsed = call_openai_parse(raw_text_clean, api_key=api_key, model=model)
 
     # Merge: prefer OpenAI value if present, otherwise local
     merged = {}
@@ -436,13 +446,33 @@ async def extract_card(file: UploadFile = File(...), authorization: Optional[str
     merged["name"] = pick("name")
     merged["designation"] = pick("title") or pick("designation")
     merged["company"] = pick("company")
-    phones = openai_parsed.get("phone") or openai_parsed.get("phone_numbers") or local_parsed.get("phone") or local_parsed.get("phone_numbers")
-    merged["phone_numbers"] = _ensure_list(phones)
+
+    # Phones: handle string vs list and local extras
+    phones_candidate = None
+    for k in ("phone_numbers", "phone"):
+        val = openai_parsed.get(k)
+        if val:
+            phones_candidate = val
+            break
+    if not phones_candidate:
+        phones_candidate = local_parsed.get("extra", {}).get("phones_all") or local_parsed.get("phone")
+
+    merged["phone_numbers"] = _ensure_list(phones_candidate)
+
     merged["email"] = pick("email")
     merged["website"] = pick("website")
     merged["address"] = pick("address")
-    social = openai_parsed.get("social_links") or local_parsed.get("social_links") or openai_parsed.get("linkedin") or local_parsed.get("extra", {}).get("linkedin")
-    merged["social_links"] = _ensure_list(social)
+
+    social_candidate = None
+    for k in ("social_links", "linkedin"):
+        val = openai_parsed.get(k)
+        if val:
+            social_candidate = val
+            break
+    if not social_candidate:
+        social_candidate = local_parsed.get("extra", {}).get("linkedin") or local_parsed.get("extra", {}).get("websites_all")
+    merged["social_links"] = _ensure_list(social_candidate)
+
     merged["more_details"] = openai_parsed.get("more_details") or local_parsed.get("more_details") or ""
     merged["additional_notes"] = openai_parsed.get("additional_notes") or local_parsed.get("additional_notes") or ""
     merged["raw_text"] = raw_text_clean
