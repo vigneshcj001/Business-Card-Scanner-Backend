@@ -4,6 +4,7 @@ import io
 import re
 import json
 import logging
+import traceback
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
@@ -34,7 +35,7 @@ TESSERACT_PATH = os.getenv("TESSERACT_PATH")
 if TESSERACT_PATH:
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 
-# Optional OpenAI client (your snippet used a custom OpenAI import)
+# Optional OpenAI client (only used for parsing OCR output)
 try:
     from openai import OpenAI
 except Exception:
@@ -47,7 +48,6 @@ def now_ist() -> str:
     return datetime.utcnow().isoformat() + "Z"
 
 def _ensure_list(v) -> List[str]:
-    """Ensure the returned value is a list of strings (empty list if not present)."""
     if v is None:
         return []
     if isinstance(v, list):
@@ -55,7 +55,6 @@ def _ensure_list(v) -> List[str]:
     if isinstance(v, (int, float)):
         return [str(v)]
     if isinstance(v, str):
-        # split common separators newlines/commas/semicolons
         items = [x.strip() for x in re.split(r"[,\n;]+", v) if x.strip()]
         return items
     try:
@@ -69,17 +68,10 @@ def clean_ocr_text(text: str) -> str:
     return text.strip()
 
 def normalize_payload(payload: dict) -> dict:
-    """
-    Convert an arbitrary incoming payload (possibly legacy keys) to the canonical shape.
-    Canonical keys:
-      - name, designation, company, phone_numbers (list), email, website, address,
-        social_links (list), more_details, additional_notes
-    """
     out = {}
     out["name"] = payload.get("name")
     out["designation"] = payload.get("designation") or payload.get("title")
     out["company"] = payload.get("company")
-    # accept either phone_numbers (list/csv) or phone (string)
     out["phone_numbers"] = _ensure_list(payload.get("phone_numbers") or payload.get("phone") or payload.get("phones"))
     out["email"] = payload.get("email")
     out["website"] = payload.get("website")
@@ -90,9 +82,6 @@ def normalize_payload(payload: dict) -> dict:
     return out
 
 def db_doc_to_canonical(doc: dict) -> dict:
-    """
-    Convert a MongoDB document to canonical JSON-friendly dict.
-    """
     if not doc:
         return {}
     canonical = {
@@ -111,7 +100,6 @@ def db_doc_to_canonical(doc: dict) -> dict:
         "edited_at": doc.get("edited_at"),
         "field_validations": doc.get("field_validations", {}),
     }
-    # optional OCR/extract fields (if present)
     if "raw_text" in doc:
         canonical["raw_text"] = doc.get("raw_text")
     if "confidence_notes" in doc:
@@ -170,36 +158,13 @@ def generate_vcard(data: Dict[str, Optional[str]]) -> str:
     lines.append("END:VCARD")
     return "\n".join(lines)
 
-def call_openai_parse(ocr_text: str, api_key: str, model: str = "gpt-4o") -> Dict[str, Any]:
-    """Call OpenAI (if installed) to parse OCR text. Returns a dict (best-effort)."""
-    if OpenAI is None:
-        raise RuntimeError("openai package not installed. Install OpenAI SDK or disable parsing.")
-    client = OpenAI(api_key=api_key)
-    prompt = PARSER_PROMPT + "\nOCR_TEXT:\n" + ocr_text + "\n\nRespond with JSON only."
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": "You are a JSON-only extractor."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.0,
-        max_tokens=512,
-    )
-    try:
-        assistant_text = resp.choices[0].message.content.strip()
-    except Exception:
-        assistant_text = str(resp)
-
-    try:
-        parsed = json.loads(assistant_text)
-        return parsed
-    except Exception:
-        m = re.search(r"\{[\s\S]*\}$", assistant_text)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except Exception:
-                pass
+def call_openai_parse_safe(ocr_text: str, api_key: Optional[str], model: str = "gpt-4o") -> Dict[str, Any]:
+    """
+    Try calling OpenAI if available and api_key provided.
+    If OpenAI not installed or no key, return a safe minimal parsed dict (OCR-only).
+    Any exceptions from OpenAI are caught and returned as 'extra' and 'confidence_notes'.
+    """
+    if OpenAI is None or not api_key:
         return {
             "name": None,
             "company": None,
@@ -208,14 +173,66 @@ def call_openai_parse(ocr_text: str, api_key: str, model: str = "gpt-4o") -> Dic
             "phone": None,
             "website": None,
             "address": None,
-            "extra": {"model_output": assistant_text},
-            "confidence_notes": "Model output not parseable as JSON. See extra.model_output."
+            "extra": {"note": "OpenAI not available; returning OCR text only."},
+            "confidence_notes": "No OpenAI parsing performed."
+        }
+
+    try:
+        client = OpenAI(api_key=api_key)
+        prompt = PARSER_PROMPT + "\nOCR_TEXT:\n" + ocr_text + "\n\nRespond with JSON only."
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a JSON-only extractor."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.0,
+            max_tokens=512,
+        )
+        try:
+            assistant_text = resp.choices[0].message.content.strip()
+        except Exception:
+            assistant_text = str(resp)
+
+        try:
+            parsed = json.loads(assistant_text)
+            return parsed
+        except Exception:
+            m = re.search(r"\{[\s\S]*\}$", assistant_text)
+            if m:
+                try:
+                    return json.loads(m.group(0))
+                except Exception:
+                    pass
+            return {
+                "name": None,
+                "company": None,
+                "title": None,
+                "email": None,
+                "phone": None,
+                "website": None,
+                "address": None,
+                "extra": {"model_output": assistant_text},
+                "confidence_notes": "Model output not parseable as JSON. See extra.model_output."
+            }
+    except Exception as e:
+        logger.exception("OpenAI call failed")
+        return {
+            "name": None,
+            "company": None,
+            "title": None,
+            "email": None,
+            "phone": None,
+            "website": None,
+            "address": None,
+            "extra": {"openai_error": str(e), "traceback": traceback.format_exc()},
+            "confidence_notes": f"OpenAI parse failed: {e}"
         }
 
 # -----------------------
 # FastAPI app
 # -----------------------
-app = FastAPI(title="Business Card OCR Backend (Canonical Payload)")
+app = FastAPI(title="Business Card OCR Backend (Full)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -230,14 +247,17 @@ async def ping():
 
 @app.post("/extract", response_model=ExtractedContact)
 async def extract_card(file: UploadFile = File(...), authorization: Optional[str] = Header(None), model: Optional[str] = "gpt-4o"):
-    # Get OpenAI API key: header Bearer > env
+    """
+    Dev-friendly /extract:
+     - Logs exceptions to console.
+     - If no OpenAI key or SDK available, falls back to OCR-only result instead of 500.
+     - Includes helpful error details in response (dev).
+    """
     api_key = None
     if authorization and authorization.lower().startswith("bearer "):
         api_key = authorization.split(" ", 1)[1].strip()
     if not api_key:
         api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=400, detail="OpenAI API key not provided.")
 
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
@@ -246,39 +266,48 @@ async def extract_card(file: UploadFile = File(...), authorization: Optional[str
     try:
         image = Image.open(io.BytesIO(contents)).convert("RGB")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
+        logger.exception("Invalid image uploaded")
+        return JSONResponse(status_code=400, content={"detail": f"Invalid image: {e}", "traceback": traceback.format_exc()})
 
-    max_dim = 1800
-    if max(image.size) > max_dim:
-        ratio = max_dim / max(image.size)
-        new_size = (int(image.size[0] * ratio), int(image.size[1] * ratio))
-        image = image.resize(new_size)
+    try:
+        max_dim = 1800
+        if max(image.size) > max_dim:
+            ratio = max_dim / max(image.size)
+            new_size = (int(image.size[0] * ratio), int(image.size[1] * ratio))
+            image = image.resize(new_size)
+    except Exception:
+        logger.exception("Image resize failed — continuing with original image")
 
     try:
         raw_text = pytesseract.image_to_string(image)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OCR failure: {e}")
+        logger.exception("OCR failed")
+        return JSONResponse(status_code=500, content={"detail": f"OCR failure: {e}", "traceback": traceback.format_exc()})
 
     raw_text = clean_ocr_text(raw_text)
 
-    parsed = call_openai_parse(raw_text, api_key=api_key, model=model)
+    parsed = call_openai_parse_safe(raw_text, api_key=api_key, model=model)
 
-    # Normalize parsed output into canonical shape
-    result = {
-        "name": parsed.get("name"),
-        "designation": parsed.get("title") or parsed.get("designation"),
-        "company": parsed.get("company"),
-        "phone_numbers": _ensure_list(parsed.get("phone") or parsed.get("phone_numbers")),
-        "email": parsed.get("email"),
-        "website": parsed.get("website"),
-        "address": parsed.get("address"),
-        "social_links": _ensure_list(parsed.get("social_links") or parsed.get("linkedin") or parsed.get("social")),
-        "more_details": parsed.get("more_details") or "",
-        "additional_notes": parsed.get("additional_notes") or "",
-        "raw_text": raw_text,
-        "confidence_notes": parsed.get("confidence_notes"),
-        "extra": parsed.get("extra"),
-    }
+    try:
+        result = {
+            "name": parsed.get("name"),
+            "designation": parsed.get("title") or parsed.get("designation"),
+            "company": parsed.get("company"),
+            "phone_numbers": _ensure_list(parsed.get("phone") or parsed.get("phone_numbers")),
+            "email": parsed.get("email"),
+            "website": parsed.get("website"),
+            "address": parsed.get("address"),
+            "social_links": _ensure_list(parsed.get("social_links") or parsed.get("linkedin") or parsed.get("social")),
+            "more_details": parsed.get("more_details") or "",
+            "additional_notes": parsed.get("additional_notes") or "",
+            "raw_text": raw_text,
+            "confidence_notes": parsed.get("confidence_notes"),
+            "extra": parsed.get("extra"),
+        }
+    except Exception as e:
+        logger.exception("Normalization failed")
+        return JSONResponse(status_code=500, content={"detail": f"Normalization failed: {e}", "traceback": traceback.format_exc(), "parsed": parsed})
+
     return JSONResponse(status_code=200, content=result)
 
 @app.post("/vcard")
@@ -307,11 +336,9 @@ async def create_card(payload: ContactBase = Body(...)):
         doc["edited_at"] = ""
         doc.setdefault("field_validations", {})
 
-        # simple dedupe by email if provided
         if doc.get("email"):
             existing = collection.find_one({"email": doc["email"]})
             if existing:
-                # merge some fields and update existing
                 if not doc.get("more_details"):
                     doc["more_details"] = existing.get("more_details", "")
                 doc["edited_at"] = now_ist()
@@ -358,7 +385,6 @@ def update_card(card_id: str, payload: dict = Body(...)):
             "email", "website", "address", "social_links",
             "additional_notes", "more_details"
         }
-        # Normalize incoming payload first, which will coerce phone & social
         normalized = normalize_payload(payload)
         update_data = {k: v for k, v in normalized.items() if k in allowed_fields}
         if not update_data:
@@ -368,7 +394,6 @@ def update_card(card_id: str, payload: dict = Body(...)):
         if not existing:
             raise HTTPException(status_code=404, detail="Card not found.")
 
-        # merge and update
         merged = dict(existing)
         merged.update(update_data)
         merged["edited_at"] = now_ist()
