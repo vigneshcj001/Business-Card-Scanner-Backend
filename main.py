@@ -115,7 +115,7 @@ def db_doc_to_canonical(doc: dict) -> dict:
 # Local regex-based extractor (fallback / augmentation)
 # -----------------------
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", re.I)
-PHONE_RE = re.compile(r"(?:\+?\d{1,3}[\s-\.])?(?:\(?\d{2,4}\)?[\s-\.])?\d{3,4}[\s-\.]?\d{3,4}")
+PHONE_RE = re.compile(r"(?:\+?\d{1,3}[\s.-])?(?:\(?\d{2,4}\)?[\s.-])?\d{3,4}[\s.-]?\d{3,4}")
 WWW_RE = re.compile(r"(?:https?://)?(?:www\.)?[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?:/[^\s]*)?", re.I)
 
 COMPANY_HINTS = [
